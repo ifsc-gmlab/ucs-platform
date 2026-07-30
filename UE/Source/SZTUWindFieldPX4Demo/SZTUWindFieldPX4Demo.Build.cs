@@ -19,7 +19,9 @@ public class SZTUWindFieldPX4Demo : ModuleRules
             "ProceduralMeshComponent",
             "UMG",
             "Slate",
-            "SlateCore"
+            "SlateCore",
+            "ImageWrapper",
+            "RenderCore"
         });
 
         // MAVLink C 头文件（从 PX4 build 拷贝，用于 SITL 仿真器接口）

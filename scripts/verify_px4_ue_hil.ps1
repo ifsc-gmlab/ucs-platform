@@ -60,8 +60,14 @@ param(
   [int]$Px4TimeoutSec = 120,
   [int]$FlightTimeoutSec = 90,
   [int]$TelemetryDurationSec = 0,
+  [string]$TelemetryHost = "127.0.0.1",
+  [ValidateRange(1, 65535)]
+  [int]$TelemetryPort = 14660,
+  [string[]]$ExtraUEArgs = @(),
+  [switch]$SkipTelemetryListener,
   [switch]$SkipFlight,
   [bool]$ShowWindArrows = $false,
+  [switch]$WindUI,
   [ValidateRange(-1.0, 30.0)]
   [double]$WindMps = -1.0,
   [switch]$KeepRunning,
@@ -200,7 +206,7 @@ function Stop-WslSim {
          "pkill -KILL -f '[p]x4_sitl_default/bin/px4' 2>/dev/null || true; " +
          "pkill -KILL -f '[s]tart_px4_ue_hil.sh' 2>/dev/null || true; " +
          "pkill -KILL -f '[p]x4_cmd_fifo' 2>/dev/null || true; " +
-         "rm -f /tmp/px4_cmd_fifo /tmp/px4_sitl.log /tmp/relay.log 2>/dev/null || true"
+         "rm -f /tmp/px4_cmd_fifo* /tmp/px4_sitl_*.log /tmp/relay*.log 2>/dev/null || true"
   [void](Invoke-WslText $cmd)
 }
 
@@ -215,9 +221,9 @@ function Stop-StaleTelemetryListeners {
 function Copy-WslArtifacts {
   if ($DryRun -or -not (Test-Path $script:RunDir)) { return }
   $runDirWsl = Get-WslPath $script:RunDir
-  $cmd = "cp /tmp/px4_sitl.log '$runDirWsl/px4_sitl.log' 2>/dev/null || true; " +
-         "cp /tmp/relay.log '$runDirWsl/relay.log' 2>/dev/null || true; " +
-         "cp /mnt/c/tmp/hil_debug.csv '$runDirWsl/hil_debug.csv' 2>/dev/null || true"
+  $cmd = "cp /tmp/px4_sitl_1.log '$runDirWsl/px4_sitl.log' 2>/dev/null || true; " +
+         "cp /tmp/relay_1.log '$runDirWsl/relay.log' 2>/dev/null || true; " +
+         "cp /mnt/c/tmp/hil_debug_4560.csv '$runDirWsl/hil_debug.csv' 2>/dev/null || cp /mnt/c/tmp/hil_debug.csv '$runDirWsl/hil_debug.csv' 2>/dev/null || true"
   [void](Invoke-WslText $cmd)
 }
 
@@ -296,6 +302,7 @@ function Write-Summary {
     "- EstimatorSettleSec: $EstimatorSettleSec",
     "- TelemetryDurationSec: $TelemetryDurationSec",
     "- ShowWindArrows: $ShowWindArrows",
+    "- WindUI: $WindUI",
     "- WindMpsOverride: $WindMps",
     "- SkipFlight: $SkipFlight",
     "",
@@ -362,6 +369,7 @@ function Start-Validation {
   Write-Step "WSL takeoff: $WslTakeoffScript"
   Write-Step "headwind test: $HeadwindTest distance=$HeadwindDistance move=$Move"
   Write-Step "wind speed override: $WindMps m/s (-1 means map default)"
+  Write-Step "UE telemetry target: ${TelemetryHost}:${TelemetryPort}; listener skipped=$SkipTelemetryListener"
   Write-Step "flight pattern: $FlightPattern circle=$CircleRadius m x $CircleLaps lap(s) / ${CircleDuration}s"
   Write-Step "vertical params: Z_P=$MpcZP Z_VEL_PI_D=$MpcZVelPAcc/$MpcZVelIAcc/$MpcZVelDAcc THR_HOVER=$MpcThrHover ABL_LIM=$Ekf2AblLim settle=${EstimatorSettleSec}s"
     return
@@ -384,9 +392,17 @@ function Start-Validation {
   if ($ShowWindArrows) {
     $ueArgs += "-ShowWindArrows"
   }
+  if ($WindUI) {
+    $ueArgs += "-WindUI"
+  }
   if ($WindMps -ge 0.0) {
     $windText = $WindMps.ToString([System.Globalization.CultureInfo]::InvariantCulture)
     $ueArgs += "-WindMps=$windText"
+  }
+  $ueArgs += "-TelemetryHost=$TelemetryHost"
+  $ueArgs += "-TelemetryPort=$TelemetryPort"
+  if ($ExtraUEArgs) {
+    $ueArgs += $ExtraUEArgs
   }
   $ueArgs += "-Vehicle=$Vehicle"
   $script:UEProc = Start-Process -FilePath $UnrealEditor -ArgumentList $ueArgs -WindowStyle Normal -PassThru
@@ -406,7 +422,7 @@ function Start-Validation {
     "SZTU_MPC_THR_HOVER=$($MpcThrHover.ToString($culture))",
     "SZTU_EKF2_ABL_LIM=$($Ekf2AblLim.ToString($culture))"
   ) -join " "
-  $launchCommand = "$launchEnvironment $WslLaunchScript"
+  $launchCommand = "$launchEnvironment $WslLaunchScript --instance 1"
 
   Write-Step "starting PX4 in WSL"
   $script:PX4Proc = Start-Process -FilePath "wsl.exe" `
@@ -422,7 +438,7 @@ function Start-Validation {
     if ($script:PX4Proc.HasExited) {
       throw "WSL PX4 launcher exited before simulator connection (exit $($script:PX4Proc.ExitCode))"
     }
-    (Invoke-WslText "test -f /tmp/px4_sitl.log && grep -q 'Simulator connected' /tmp/px4_sitl.log && echo OK || true") -match "OK"
+    (Invoke-WslText "test -f /tmp/px4_sitl_1.log && grep -q 'Simulator connected' /tmp/px4_sitl_1.log && echo OK || true") -match "OK"
   }
   if (-not $script:Status.PX4Connected) { throw "PX4 did not connect to UE" }
 
@@ -430,7 +446,7 @@ function Start-Validation {
     if ($script:PX4Proc.HasExited) {
       throw "WSL PX4 launcher exited before readiness (exit $($script:PX4Proc.ExitCode))"
     }
-    (Invoke-WslText "test -f /tmp/px4_sitl.log && grep -q 'Ready for takeoff' /tmp/px4_sitl.log && echo OK || true") -match "OK"
+    (Invoke-WslText "test -f /tmp/px4_sitl_1.log && grep -q 'Ready for takeoff' /tmp/px4_sitl_1.log && echo OK || true") -match "OK"
   }
   if (-not $script:Status.PX4Ready) { throw "PX4 did not become ready for takeoff" }
 
@@ -439,31 +455,36 @@ function Start-Validation {
     Start-Sleep -Seconds $EstimatorSettleSec
   }
 
-  Write-Step "starting UE telemetry listener"
-  $patternSeconds = if ($FlightPattern -eq "circle") { $CircleDuration + 2.0 * $CircleEntry } else { 0.0 }
-  $computedTelemetrySeconds = [Math]::Max(40, [int]($Climb + $Hold + $Move + $patternSeconds + $Descend + 35))
-  $telemetrySeconds = if ($TelemetryDurationSec -gt 0) {
-    [Math]::Max(10, $TelemetryDurationSec)
+  if (-not $SkipTelemetryListener) {
+    Write-Step "starting UE telemetry listener"
+    $patternSeconds = if ($FlightPattern -eq "circle") { $CircleDuration + 2.0 * $CircleEntry } else { 0.0 }
+    $computedTelemetrySeconds = [Math]::Max(40, [int]($Climb + $Hold + $Move + $patternSeconds + $Descend + 35))
+    $telemetrySeconds = if ($TelemetryDurationSec -gt 0) {
+      [Math]::Max(10, $TelemetryDurationSec)
+    }
+    else {
+      $computedTelemetrySeconds
+    }
+    $script:TelemetryProc = Start-Process -FilePath $PythonExe `
+      -ArgumentList @((Join-Path $script:RepoRoot "outputs\listen_telem_long.py"), "$telemetrySeconds") `
+      -RedirectStandardOutput (Join-Path $script:RunDir "telemetry.log") `
+      -RedirectStandardError (Join-Path $script:RunDir "telemetry.err.log") `
+      -WindowStyle Hidden `
+      -PassThru
+    Start-Sleep -Seconds 1
+    if ($script:TelemetryProc.HasExited) {
+      $telemetryError = Join-Path $script:RunDir "telemetry.err.log"
+      $errorText = if (Test-Path -LiteralPath $telemetryError) {
+        (Get-Content -LiteralPath $telemetryError -Raw -ErrorAction SilentlyContinue).Trim()
+      }
+      else { "no stderr output" }
+      throw "UE telemetry listener exited immediately: $errorText"
+    }
+    $script:Status.TelemetryStarted = $true
   }
   else {
-    $computedTelemetrySeconds
+    Write-Step "UE telemetry listener skipped; an external controller owns ${TelemetryHost}:${TelemetryPort}"
   }
-  $script:TelemetryProc = Start-Process -FilePath $PythonExe `
-    -ArgumentList @((Join-Path $script:RepoRoot "outputs\listen_telem_long.py"), "$telemetrySeconds") `
-    -RedirectStandardOutput (Join-Path $script:RunDir "telemetry.log") `
-    -RedirectStandardError (Join-Path $script:RunDir "telemetry.err.log") `
-    -WindowStyle Hidden `
-    -PassThru
-  Start-Sleep -Seconds 1
-  if ($script:TelemetryProc.HasExited) {
-    $telemetryError = Join-Path $script:RunDir "telemetry.err.log"
-    $errorText = if (Test-Path -LiteralPath $telemetryError) {
-      (Get-Content -LiteralPath $telemetryError -Raw -ErrorAction SilentlyContinue).Trim()
-    }
-    else { "no stderr output" }
-    throw "UE telemetry listener exited immediately: $errorText"
-  }
-  $script:Status.TelemetryStarted = $true
 
   if (-not $SkipFlight) {
     Write-Step "running WSL offboard takeoff script"
@@ -475,7 +496,7 @@ function Start-Validation {
       if ($HeadwindTest) { throw "-HeadwindTest cannot be combined with -FlightPattern circle" }
       $extraFlightArgs = "--circle-radius $CircleRadius --circle-laps $CircleLaps --circle-duration $CircleDuration --circle-entry $CircleEntry"
     }
-    $takeoffCmd = "cd ~/szefitl && python3 $WslTakeoffScript --alt $Alt --hold $Hold --climb $Climb --descend $Descend $extraFlightArgs"
+    $takeoffCmd = "cd ~/szefitl && python3 $WslTakeoffScript --instance 1 --alt $Alt --hold $Hold --climb $Climb --descend $Descend $extraFlightArgs"
     $takeoff = Start-Process -FilePath "wsl.exe" `
       -ArgumentList @("bash", "-lc", $takeoffCmd) `
       -RedirectStandardOutput (Join-Path $script:RunDir "takeoff_offboard.log") `

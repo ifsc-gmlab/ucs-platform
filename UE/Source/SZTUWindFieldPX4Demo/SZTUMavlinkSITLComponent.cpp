@@ -55,6 +55,29 @@ void USZTUMavlinkSITLComponent::EndPlay(const EEndPlayReason::Type EndPlayReason
         if (SocketSubsystem) { SocketSubsystem->DestroySocket(ServerSocket); }
         ServerSocket = nullptr;
     }
+    if (DebugFile)
+    {
+        fclose(DebugFile);
+        DebugFile = nullptr;
+    }
+}
+
+void USZTUMavlinkSITLComponent::ReinitServerSocket()
+{
+    // 关闭旧 socket（如果存在），用当前 ListenPort 重新 bind。
+    // 用途：Owner Pawn 在 BeginPlay 改了 ListenPort 后调用。
+    if (ClientSocket)
+    {
+        if (SocketSubsystem) { SocketSubsystem->DestroySocket(ClientSocket); }
+        ClientSocket = nullptr;
+    }
+    if (ServerSocket)
+    {
+        if (SocketSubsystem) { SocketSubsystem->DestroySocket(ServerSocket); }
+        ServerSocket = nullptr;
+    }
+    UE_LOG(LogTemp, Display, TEXT("[SITL] Reinit server socket with ListenPort=%d"), ListenPort);
+    InitServerSocket();
 }
 
 void USZTUMavlinkSITLComponent::InitServerSocket()
@@ -203,7 +226,7 @@ void USZTUMavlinkSITLComponent::SendScheduledMessages(float DeltaTime)
     // 旧实现在收到 HIL_ACTUATOR_CONTROLS 后把 TimeUsec 从 1.7e15 硬跳到 1e8，
     // 造成 HIL_SENSOR 时间戳巨幅回退，PX4 把后续所有 sensor 判为“时间倒流”而丢弃，
     // 于是 PX4 只处理第一条 sensor、永不回发 actuator（锁步死锁，UE 30s 超时断开）。
-    static uint64_t TimeUsec = 0;
+    // 2026-07-21：改为成员变量（非 static），双机并行时每实例独立时钟，避免时序互扰。
     if (TimeUsec == 0)
     {
         TimeUsec = (uint64_t)FDateTime::UtcNow().ToUnixTimestamp() * 1000000ULL;
@@ -230,15 +253,16 @@ void USZTUMavlinkSITLComponent::SendScheduledMessages(float DeltaTime)
         float QuatArr[4] = { Q.W, Q.X, Q.Y, Q.Z };
         // === HIL 调试日志（CSV）：记录发往 PX4 的四元数/角速度/加速度/电机/高度 ===
         {
-            static FILE* DbgF = nullptr;
-            if (!DbgF)
+            if (!DebugFile)
             {
-                DbgF = fopen("C:/tmp/hil_debug.csv", "w");
-                if (DbgF) fprintf(DbgF, "t,w,x,y,z,gx,gy,gz,ax,ay,az,m0,m1,m2,m3,posz,craw_qw,craw_qx,craw_qy,craw_qz\n");
+                // 双机并行：按 ListenPort 区分文件名，避免两个实例写同一个文件
+                const FString DbgPath = FString::Printf(TEXT("C:/tmp/hil_debug_%d.csv"), ListenPort);
+                DebugFile = fopen(TCHAR_TO_ANSI(*DbgPath), "w");
+                if (DebugFile) fprintf(DebugFile, "t,w,x,y,z,gx,gy,gz,ax,ay,az,m0,m1,m2,m3,posz,craw_qw,craw_qx,craw_qy,craw_qz\n");
             }
-            if (DbgF)
+            if (DebugFile)
             {
-                fprintf(DbgF,
+                fprintf(DebugFile,
                     "%llu,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%.3f,%.3f,%.4f,%.4f,%.4f,%.4f\n",
                     TimeUsec, Q.W, Q.X, Q.Y, Q.Z,
                     CachedAngVelRadS.X, CachedAngVelRadS.Y, CachedAngVelRadS.Z,
@@ -246,7 +270,7 @@ void USZTUMavlinkSITLComponent::SendScheduledMessages(float DeltaTime)
                     MotorThrusts[0], MotorThrusts[1], MotorThrusts[2], MotorThrusts[3],
                     CachedPositionM.Z,
                     CachedAttitude.W, CachedAttitude.X, CachedAttitude.Y, CachedAttitude.Z);
-                fflush(DbgF);
+                fflush(DebugFile);
             }
         }
         int32 HStateLat = 0, HStateLon = 0;

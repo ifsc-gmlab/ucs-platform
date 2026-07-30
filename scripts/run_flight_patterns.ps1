@@ -26,6 +26,7 @@ param(
   [ValidateRange(0, 120)]
   [int]$EstimatorSettleSec = 35,
   [int]$FlightTimeoutSec = 160,
+  [int]$TcpTimeoutSec = 90,
   [switch]$KeepRunning,
   [switch]$DryRun
 )
@@ -77,6 +78,7 @@ $verifyParams = @{
   Ekf2AblLim = $Ekf2AblLim
   EstimatorSettleSec = $EstimatorSettleSec
   FlightTimeoutSec = $FlightTimeoutSec
+  TcpTimeoutSec = $TcpTimeoutSec
   KeepRunning = $KeepRunning
   DryRun = $DryRun
 }

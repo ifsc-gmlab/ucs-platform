@@ -30,8 +30,8 @@ ASZTUWindFlag::ASZTUWindFlag()
     FlagMesh = CreateDefaultSubobject<UProceduralMeshComponent>(TEXT("FlagMesh"));
     FlagMesh->SetupAttachment(SceneRoot);
     FlagMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-    FlagMesh->SetCastShadow(false);
-    FlagMesh->SetRelativeLocation(FVector(0.0f, 0.0f, 180.0f));
+    FlagMesh->SetCastShadow(true);
+    FlagMesh->SetRelativeLocation(FVector(0.0f, 0.0f, 150.0f));
     // 旗面：M_FlagColor（红色）
     static ConstructorHelpers::FObjectFinder<UMaterialInterface> FlagMat(TEXT("/Game/Drone/Materials/M_FlagColor.M_FlagColor"));
     if (FlagMat.Succeeded())
@@ -71,16 +71,18 @@ void ASZTUWindFlag::ApplyFlagMaterials()
         UMaterialInstanceDynamic* FlagDMID = UMaterialInstanceDynamic::Create(FlagMat, this);
         if (FlagDMID)
         {
-            FlagDMID->SetVectorParameterValue(TEXT("BaseColor"), FLinearColor(0.50f, 0.025f, 0.015f, 1.0f));
-            FlagDMID->SetScalarParameterValue(TEXT("Roughness"), 0.98f);
-            FlagDMID->SetScalarParameterValue(TEXT("Specular"), 0.0f);
+            const FLinearColor FabricRed = FLinearColor::FromSRGBColor(FColor(150, 31, 32));
+            FlagDMID->SetVectorParameterValue(TEXT("BaseColor"), FabricRed);
+            FlagDMID->SetScalarParameterValue(TEXT("Roughness"), 0.85f);
+            FlagDMID->SetScalarParameterValue(TEXT("Specular"), 0.12f);
+            FlagDMID->SetScalarParameterValue(TEXT("AmbientFill"), 0.08f);
             FlagMesh->SetMaterial(0, FlagDMID);
         }
         else
         {
             FlagMesh->SetMaterial(0, FlagMat);
         }
-        UE_LOG(LogTemp, Display, TEXT("Flag runtime material applied: M_FlagColor matte red"));
+        UE_LOG(LogTemp, Display, TEXT("Flag runtime material applied: M_FlagColor lit fabric red"));
     }
 }
 
@@ -102,7 +104,7 @@ void ASZTUWindFlag::Tick(float DeltaSeconds)
         }
     }
 
-    UpdateFlagSimulation(DeltaSeconds);
+    UpdateSoftFlagSimulation(DeltaSeconds);
 
     // Debug: 在旗尖画圆球，确认物理是否产生位移
     if (bDebugDrawTip && Positions.Num() > 0 && GetWorld())
@@ -161,7 +163,7 @@ void ASZTUWindFlag::BuildFlagGeometry()
         }
     }
 
-    // 正面 + 反面三角（双面几何）
+    // One geometric surface is enough; M_FlagColor handles two-sided rendering.
     for (int32 Row = 0; Row < GridRows; ++Row)
     {
         for (int32 Col = 0; Col < GridCols; ++Col)
@@ -173,9 +175,6 @@ void ASZTUWindFlag::BuildFlagGeometry()
             // 正面（法线朝 X）
             Triangles.Add(A); Triangles.Add(B); Triangles.Add(D);
             Triangles.Add(A); Triangles.Add(D); Triangles.Add(C);
-            // 反面
-            Triangles.Add(A); Triangles.Add(D); Triangles.Add(B);
-            Triangles.Add(A); Triangles.Add(C); Triangles.Add(D);
         }
     }
 
@@ -187,7 +186,20 @@ void ASZTUWindFlag::BuildFlagGeometry()
     ApplyFlagMaterials();
 
     Positions = RestPositions;
+    for (int32 Row = 0; Row < NumRows; ++Row)
+    {
+        for (int32 Col = 1; Col < NumCols; ++Col)
+        {
+            const int32 Index = Row * NumCols + Col;
+            const float AlongFlag = float(Col) / float(GridCols);
+            Positions[Index].Z -= InitialSagCm * FMath::Pow(AlongFlag, 1.35f);
+            Positions[Index].X += InitialFoldCm
+                * FMath::Sin(float(Row) * 0.9f + float(Col) * 0.45f)
+                * AlongFlag;
+        }
+    }
     Velocities.SetNumZeroed(Positions.Num());
+    UpdateSurfaceNormals();
 
     UE_LOG(LogTemp, Display, TEXT("Flag built: %dx%d grid, %d verts, %d tris"),
         GridCols, GridRows, Vertices.Num(), Triangles.Num());
@@ -271,6 +283,197 @@ void ASZTUWindFlag::UpdateFlagSimulation(float DeltaSeconds)
 
     // 更新 ProceduralMesh 顶点位置
     FlagMesh->UpdateMeshSection(0, Positions, TArray<FVector>(), TArray<FVector2D>(), TArray<FColor>(), TArray<FProcMeshTangent>());
+}
+
+void ASZTUWindFlag::UpdateSoftFlagSimulation(float DeltaSeconds)
+{
+    if (RestPositions.Num() == 0 || Positions.Num() != RestPositions.Num()) { return; }
+
+    constexpr float FixedSubStep = 1.0f / 120.0f;
+    const int32 NumSubSteps = FMath::Clamp(FMath::CeilToInt(DeltaSeconds / FixedSubStep), 1, 8);
+    const float DT = DeltaSeconds / float(NumSubSteps);
+    const float InvMass = 1.0f / FMath::Max(Mass, 0.1f);
+    const int32 NumCols = GridCols + 1;
+    const int32 NumRows = GridRows + 1;
+    const float CellW = FlagWidth / FMath::Max(GridCols, 1);
+    const float CellH = FlagHeight / FMath::Max(GridRows, 1);
+    const float DiagonalLength = FMath::Sqrt(CellW * CellW + CellH * CellH);
+    const FVector LocalGravity = GetActorTransform().InverseTransformVectorNoScale(
+        FVector(0.0f, 0.0f, -980.0f * GravityScale));
+
+    const auto IsFixed = [NumCols](int32 Index)
+    {
+        return Index % NumCols == 0;
+    };
+
+    for (int32 Step = 0; Step < NumSubSteps; ++Step)
+    {
+        const TArray<FVector> PreviousPositions = Positions;
+
+        for (int32 Index = 0; Index < Positions.Num(); ++Index)
+        {
+            if (IsFixed(Index))
+            {
+                Positions[Index] = RestPositions[Index];
+                Velocities[Index] = FVector::ZeroVector;
+                continue;
+            }
+
+            const FVector WorldPos = GetActorTransform().TransformPosition(Positions[Index]);
+            const FVector WindForce = GetVertexWindForce(WorldPos);
+            const float WindSpeedMps = FMath::Abs(WindDragCoeff) > KINDA_SMALL_NUMBER
+                ? FMath::Abs(WindForce.X / WindDragCoeff)
+                : 0.0f;
+            const float FlutterScale = FMath::Clamp(WindSpeedMps / 8.0f, 0.0f, 1.5f);
+            const float AlongFlag = FMath::Clamp(RestPositions[Index].Y / FMath::Max(FlagWidth, 1.0f), 0.0f, 1.0f);
+            const float HeightPhase = RestPositions[Index].Z / FMath::Max(FlagHeight, 1.0f);
+            const float Time = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0f;
+            const float Flutter = FlutterAmplitude * FlutterScale * (
+                FMath::Sin(AlongFlag * 11.0f - Time * 8.0f + HeightPhase * 2.5f) * 0.65f
+                + FMath::Sin(AlongFlag * 19.0f - Time * 12.5f - HeightPhase * 4.0f) * 0.35f);
+            const FVector FlutterForce(Flutter, 0.0f, Flutter * 0.08f);
+            const float LeverScale = FMath::Sqrt(AlongFlag);
+            const FVector Acceleration = LocalGravity + (WindForce + FlutterForce) * LeverScale * InvMass;
+
+            Velocities[Index] += Acceleration * DT;
+            Velocities[Index] *= FMath::Exp(-Damping * DT);
+            Velocities[Index] = Velocities[Index].GetClampedToMaxSize(MaxDisplacement * 5.0f);
+            Positions[Index] += Velocities[Index] * DT;
+        }
+
+        const auto SolveDistanceConstraint = [&](int32 A, int32 B, float RestLength, float Strength)
+        {
+            FVector Delta = Positions[B] - Positions[A];
+            const float Length = Delta.Size();
+            if (Length <= KINDA_SMALL_NUMBER) { return; }
+
+            const FVector Correction = Delta * ((Length - RestLength) / Length) * Strength;
+            const bool bFixedA = IsFixed(A);
+            const bool bFixedB = IsFixed(B);
+            if (bFixedA && !bFixedB)
+            {
+                Positions[B] -= Correction;
+            }
+            else if (!bFixedA && bFixedB)
+            {
+                Positions[A] += Correction;
+            }
+            else if (!bFixedA && !bFixedB)
+            {
+                Positions[A] += Correction * 0.5f;
+                Positions[B] -= Correction * 0.5f;
+            }
+        };
+
+        for (int32 Iteration = 0; Iteration < FMath::Max(ConstraintIterations, 1); ++Iteration)
+        {
+            for (int32 Row = 0; Row < NumRows; ++Row)
+            {
+                for (int32 Col = 0; Col < NumCols; ++Col)
+                {
+                    const int32 A = Row * NumCols + Col;
+                    if (Col < GridCols)
+                    {
+                        SolveDistanceConstraint(A, A + 1, CellW, StretchConstraintStrength);
+                    }
+                    if (Row < GridRows)
+                    {
+                        SolveDistanceConstraint(A, A + NumCols, CellH, StretchConstraintStrength);
+                    }
+                    if (Col < GridCols && Row < GridRows)
+                    {
+                        SolveDistanceConstraint(A, A + NumCols + 1, DiagonalLength, ShearConstraintStrength);
+                        SolveDistanceConstraint(A + 1, A + NumCols, DiagonalLength, ShearConstraintStrength);
+                    }
+                    if (Col + 2 < NumCols)
+                    {
+                        SolveDistanceConstraint(A, A + 2, CellW * 2.0f, BendConstraintStrength);
+                    }
+                    if (Row + 2 < NumRows)
+                    {
+                        SolveDistanceConstraint(A, A + NumCols * 2, CellH * 2.0f, BendConstraintStrength);
+                    }
+                }
+            }
+
+            for (int32 Row = 0; Row < NumRows; ++Row)
+            {
+                const int32 FixedIndex = Row * NumCols;
+                Positions[FixedIndex] = RestPositions[FixedIndex];
+            }
+        }
+
+        for (int32 Index = 0; Index < Positions.Num(); ++Index)
+        {
+            if (IsFixed(Index))
+            {
+                Positions[Index] = RestPositions[Index];
+                Velocities[Index] = FVector::ZeroVector;
+                continue;
+            }
+
+            const FVector Displacement = Positions[Index] - RestPositions[Index];
+            if (Displacement.SizeSquared() > FMath::Square(MaxDisplacement))
+            {
+                Positions[Index] = RestPositions[Index] + Displacement.GetSafeNormal() * MaxDisplacement;
+            }
+            Positions[Index].X = FMath::Clamp(Positions[Index].X, -FlagWidth * 0.6f, FlagWidth * 0.6f);
+            Velocities[Index] = (Positions[Index] - PreviousPositions[Index]) / FMath::Max(DT, KINDA_SMALL_NUMBER);
+        }
+    }
+
+    UpdateSurfaceNormals();
+    FlagMesh->UpdateMeshSection(
+        0, Positions, SurfaceNormals, TArray<FVector2D>(), TArray<FColor>(), SurfaceTangents);
+}
+
+void ASZTUWindFlag::UpdateSurfaceNormals()
+{
+    const int32 NumCols = GridCols + 1;
+    const int32 NumRows = GridRows + 1;
+    if (Positions.Num() != NumCols * NumRows) { return; }
+
+    SurfaceNormals.Init(FVector::ZeroVector, Positions.Num());
+    for (int32 Row = 0; Row < GridRows; ++Row)
+    {
+        for (int32 Col = 0; Col < GridCols; ++Col)
+        {
+            const int32 A = Row * NumCols + Col;
+            const int32 B = A + 1;
+            const int32 C = A + NumCols;
+            const int32 D = C + 1;
+            const FVector N0 = FVector::CrossProduct(Positions[B] - Positions[A], Positions[D] - Positions[A]);
+            const FVector N1 = FVector::CrossProduct(Positions[D] - Positions[A], Positions[C] - Positions[A]);
+            SurfaceNormals[A] += N0 + N1;
+            SurfaceNormals[B] += N0;
+            SurfaceNormals[C] += N1;
+            SurfaceNormals[D] += N0 + N1;
+        }
+    }
+
+    SurfaceTangents.SetNum(Positions.Num());
+    for (int32 Row = 0; Row < NumRows; ++Row)
+    {
+        for (int32 Col = 0; Col < NumCols; ++Col)
+        {
+            const int32 Index = Row * NumCols + Col;
+            SurfaceNormals[Index] = SurfaceNormals[Index].GetSafeNormal();
+            if (SurfaceNormals[Index].IsNearlyZero())
+            {
+                SurfaceNormals[Index] = FVector(1.0f, 0.0f, 0.0f);
+            }
+
+            const int32 Neighbor = Col < GridCols ? Index + 1 : Index - 1;
+            FVector Tangent = (Positions[Neighbor] - Positions[Index]).GetSafeNormal();
+            Tangent -= SurfaceNormals[Index] * FVector::DotProduct(Tangent, SurfaceNormals[Index]);
+            Tangent = Tangent.GetSafeNormal();
+            if (Tangent.IsNearlyZero())
+            {
+                Tangent = FVector(0.0f, 1.0f, 0.0f);
+            }
+            SurfaceTangents[Index] = FProcMeshTangent(Tangent.X, Tangent.Y, Tangent.Z);
+        }
+    }
 }
 
 FVector ASZTUWindFlag::GetVertexWindForce(const FVector& WorldPos) const

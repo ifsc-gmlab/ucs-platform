@@ -29,6 +29,7 @@ param(
   [double]$Descend = 10.0,
   [ValidateRange(60, 600)]
   [int]$FlightTimeoutSec = 160,
+  [int]$TcpTimeoutSec = 90,
   [switch]$KeepRunning,
   [switch]$DryRun
 )
@@ -55,6 +56,7 @@ $circleParams = @{
   CircleDuration = $Duration
   CircleEntry = $Entry
   FlightTimeoutSec = $FlightTimeoutSec
+  TcpTimeoutSec = $TcpTimeoutSec
   KeepRunning = $KeepRunning
   DryRun = $DryRun
 }

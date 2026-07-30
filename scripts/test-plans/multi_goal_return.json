@@ -1,0 +1,22 @@
+{
+  "steps": [
+    {
+      "action": "fly_to",
+      "goal_id": "inspection_gate",
+      "vision": false
+    },
+    {
+      "action": "fly_to",
+      "goal_id": "medical_station",
+      "vision": false
+    },
+    {
+      "action": "fly_to",
+      "goal_id": "start_pad",
+      "vision": false
+    },
+    {
+      "action": "land"
+    }
+  ]
+}

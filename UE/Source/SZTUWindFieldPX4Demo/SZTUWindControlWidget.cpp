@@ -20,19 +20,19 @@ TSharedRef<SWidget> USZTUWindControlWidget::RebuildWidget()
     LargeSliderStyle = FAppStyle::Get().GetWidgetStyle<FSliderStyle>(TEXT("Slider"));
     LargeSliderStyle.SetBarThickness(8.0f);
     FSlateBrush NormalThumb = LargeSliderStyle.NormalThumbImage;
-    NormalThumb.ImageSize = FVector2D(26.0f, 26.0f);
+    NormalThumb.ImageSize = FVector2D(22.0f, 22.0f);
     LargeSliderStyle.SetNormalThumbImage(NormalThumb);
     FSlateBrush HoveredThumb = LargeSliderStyle.HoveredThumbImage;
-    HoveredThumb.ImageSize = FVector2D(32.0f, 32.0f);
+    HoveredThumb.ImageSize = FVector2D(28.0f, 28.0f);
     LargeSliderStyle.SetHoveredThumbImage(HoveredThumb);
 
     TSharedRef<SWidget> Widget =
         SNew(SBox)
-        .WidthOverride(420.0f)
-        .HeightOverride(130.0f)
+        .WidthOverride(380.0f)
+        .HeightOverride(120.0f)
         [
             SNew(SBorder)
-            .Padding(FMargin(18.0f, 14.0f))
+            .Padding(FMargin(16.0f, 12.0f))
             .BorderBackgroundColor(FLinearColor(0.025f, 0.03f, 0.035f, 0.92f))
             [
                 SNew(SVerticalBox)
@@ -40,20 +40,20 @@ TSharedRef<SWidget> USZTUWindControlWidget::RebuildWidget()
                 .AutoHeight()
                 [
                     SAssignNew(WindSpeedLabel, STextBlock)
-                    .Font(FCoreStyle::GetDefaultFontStyle("Bold", 20))
+                    .Font(FCoreStyle::GetDefaultFontStyle("Bold", 18))
                     .ColorAndOpacity(FSlateColor(FLinearColor(0.92f, 0.96f, 0.98f)))
                     .Text(FText::FromString(FString::Printf(TEXT("Current wind: %.1f m/s"), InitialWindMps)))
                 ]
                 + SVerticalBox::Slot()
                 .AutoHeight()
-                .Padding(FMargin(0.0f, 10.0f, 0.0f, 0.0f))
+                .Padding(FMargin(0.0f, 8.0f, 0.0f, 0.0f))
                 [
                     SNew(SBox)
-                    .HeightOverride(44.0f)
+                    .HeightOverride(40.0f)
                     [
                         SNew(SSlider)
                         .Style(&LargeSliderStyle)
-                        .StepSize(0.025f)
+                        .StepSize(1.0f / 30.0f)
                         .MouseUsesStep(true)
                         .Value(GetSliderValue())
                         .OnValueChanged(FOnFloatValueChanged::CreateUObject(this, &USZTUWindControlWidget::HandleWindSpeedChanged))

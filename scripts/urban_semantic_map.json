@@ -1,0 +1,86 @@
+{
+  "map_id": "sztu_urban_semantic_v1",
+  "ue_map": "/Game/Maps/SZTUUrbanSemanticScene",
+  "frame": "PX4_LOCAL_NED",
+  "origin_world_m": [2.5, 0.0, 0.0],
+  "default_goal": "delivery_zone",
+  "goals": {
+    "start_pad": {
+      "label": "A Start",
+      "position_m": [0.0, 0.0],
+      "aliases": ["start", "home", "a"]
+    },
+    "inspection_gate": {
+      "label": "Inspection Gate",
+      "position_m": [6.0, -4.0],
+      "aliases": ["inspection", "gate", "checkpoint"]
+    },
+    "delivery_zone": {
+      "label": "B Delivery Zone",
+      "position_m": [18.0, 0.0],
+      "aliases": ["delivery", "dropoff", "b"]
+    },
+    "medical_station": {
+      "label": "Medical Station",
+      "position_m": [18.0, 4.0],
+      "aliases": ["medical", "hospital", "aid"]
+    }
+  },
+  "obstacles": [
+    {
+      "id": "central_block",
+      "center_m": [8.0, 0.0],
+      "size_m": [2.0, 4.6, 5.5]
+    },
+    {
+      "id": "building_south_1",
+      "center_m": [-4.5, -9.0],
+      "size_m": [4.6, 5.0, 5.0]
+    },
+    {
+      "id": "building_south_2",
+      "center_m": [2.0, -9.0],
+      "size_m": [4.6, 5.0, 6.8]
+    },
+    {
+      "id": "building_south_3",
+      "center_m": [8.5, -9.0],
+      "size_m": [4.6, 5.0, 8.6]
+    },
+    {
+      "id": "building_south_4",
+      "center_m": [15.0, -9.0],
+      "size_m": [4.6, 5.0, 5.0]
+    },
+    {
+      "id": "building_south_5",
+      "center_m": [21.5, -9.0],
+      "size_m": [4.6, 5.0, 6.8]
+    },
+    {
+      "id": "building_north_1",
+      "center_m": [-2.7, 9.0],
+      "size_m": [4.2, 5.0, 6.0]
+    },
+    {
+      "id": "building_north_2",
+      "center_m": [3.8, 9.0],
+      "size_m": [4.2, 5.0, 7.8]
+    },
+    {
+      "id": "building_north_3",
+      "center_m": [10.3, 9.0],
+      "size_m": [4.2, 5.0, 9.6]
+    },
+    {
+      "id": "building_north_4",
+      "center_m": [16.8, 9.0],
+      "size_m": [4.2, 5.0, 6.0]
+    },
+    {
+      "id": "building_north_5",
+      "center_m": [23.3, 9.0],
+      "size_m": [4.2, 5.0, 7.8]
+    }
+  ]
+}

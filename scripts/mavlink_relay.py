@@ -1,15 +1,24 @@
 #!/usr/bin/env python3
-"""Bridge PX4's WSL-local GCS MAVLink stream to Windows QGroundControl."""
+"""Bridge PX4's WSL-local GCS MAVLink stream to Windows QGroundControl.
+
+Single-instance relay: one process per PX4 SITL instance. For dual-drone,
+run two processes with different env vars:
+  instance 1: PX4_GCS_PORT=18570 QGC_RELAY_PORT=14550 python3 mavlink_relay.py
+  instance 2: PX4_GCS_PORT=18571 QGC_RELAY_PORT=14551 python3 mavlink_relay.py
+"""
 
 import os
 import socket
 import struct
 
 
+# WSL 端 listen 端口 = QGC_RELAY_PORT (默认 14550)
+# Windows QGC 把消息发到 WSL_IP:QGC_RELAY_PORT；relay 转发到 PX4_GCS_PORT
+# PX4 把 GCS 消息发到 127.0.0.1:PX4_GCS_PORT；relay 转发到 Windows:QGC_WIN_PORT
 LISTEN_PORT = int(os.environ.get("QGC_RELAY_PORT", "14550"))
 PX4_ADDR = ("127.0.0.1", int(os.environ.get("PX4_GCS_PORT", "18570")))
 WIN_IP = os.environ.get("QGC_WIN_IP", "172.19.208.1")
-WIN_ADDR = (WIN_IP, int(os.environ.get("QGC_WIN_PORT", "14550")))
+WIN_ADDR = (WIN_IP, int(os.environ.get("QGC_WIN_PORT", os.environ.get("QGC_RELAY_PORT", "14550"))))
 
 COMMAND_NAMES = {
     22: "MAV_CMD_NAV_TAKEOFF",
@@ -85,6 +94,7 @@ def describe_control_message(message_id, payload):
 
 def main():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(("0.0.0.0", LISTEN_PORT))
     print(f"[relay] listening on 0.0.0.0:{LISTEN_PORT}", flush=True)
     print(f"[relay] QGC {WIN_ADDR} <-> PX4 {PX4_ADDR}", flush=True)

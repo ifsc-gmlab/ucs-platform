@@ -11,6 +11,7 @@
 #include "SZTUWindFieldPX4Demo.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Components/StaticMeshComponent.h"
+#include "Components/TextRenderComponent.h"
 
 ASZTUWindFieldGameMode::ASZTUWindFieldGameMode()
 {
@@ -88,7 +89,26 @@ void ASZTUWindFieldGameMode::StartPlay()
         }
     }
 
-    if (bUseObserverCamera && !FParse::Param(FCommandLine::Get(), TEXT("NoObserverCamera")))
+    bool bOnboardCameraActivated = false;
+    if (FParse::Param(FCommandLine::Get(), TEXT("OnboardCamera")))
+    {
+        if (APlayerController* PlayerController = GetWorld()->GetFirstPlayerController())
+        {
+            for (TActorIterator<ASZTUDronePawn> It(GetWorld()); It; ++It)
+            {
+                if (It->OnboardCamera)
+                {
+                    It->OnboardCamera->SetActive(true);
+                    PlayerController->SetViewTarget(*It);
+                    bOnboardCameraActivated = true;
+                    UE_LOG(LogSZTUWindField, Display, TEXT("Onboard camera active on DroneId=%d"), It->DroneId);
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!bOnboardCameraActivated && bUseObserverCamera && !FParse::Param(FCommandLine::Get(), TEXT("NoObserverCamera")))
     {
         FVector CameraLocation = ObserverCameraLocation;
         FVector CameraLookAt = ObserverCameraLookAt;
@@ -106,6 +126,38 @@ void ASZTUWindFieldGameMode::StartPlay()
             CameraLookAt = FVector(250.0f, 0.0f, 35.0f);
             CameraFOV = 72.0f;
         }
+        else if (MapName.Contains(TEXT("SZTUFactoryFlightScene")))
+        {
+            CameraLocation = FVector(-350.0f, -1500.0f, 650.0f);
+            CameraLookAt = FVector(0.0f, 150.0f, 110.0f);
+            CameraFOV = 68.0f;
+        }
+        else if (MapName.Contains(TEXT("SZTUUrbanSemanticScene")))
+        {
+            // View the corridor from +Y toward -Y. The previous -Y camera made
+            // the scene read backwards during review.
+            CameraLocation = FVector(1100.0f, 1050.0f, 2450.0f);
+            CameraLookAt = FVector(1150.0f, 0.0f, 80.0f);
+            CameraFOV = 70.0f;
+        }
+                    else if (MapName.Contains(TEXT("SZTUFactoryDualScene")))
+                    {
+                        // 双机场景专用 v4：俯视相机 (0, -3, 6) m 看向 (0, 0, 0) m，
+                        // FOV 80° 宽视角让两架（X=±1.5m）都装进视野。
+                        CameraLocation = FVector(0.0f, -300.0f, 600.0f);
+                        CameraLookAt = FVector(0.0f, 0.0f, 0.0f);
+                        CameraFOV = 80.0f;
+                    }
+                    else if (MapName.Contains(TEXT("SZTUFactoryWindScene")))
+                    {
+                        // 中距侧斜俯视 v7：相机 (3, -6, 3.5) m 看向 (2.5, 0, 1.2) m，FOV 55°。
+                        // 距离 6m 折中——飞机约 35 像素可见，旗子/集装箱在背景，扇墙扇阵不挡视野中央。
+                        // v1/v8/v9/v10（远距 15m）都被风墙扇阵或集装箱挡视野；v7 是唯一能看到飞机的视角。
+                        // 配合 UI 右上角 + 黄色机身 emissive 0.20 + 调暗扇叶 (0.05,0.18,0.20)，整体协调。
+                        CameraLocation = FVector(300.0f, -600.0f, 350.0f);
+                        CameraLookAt = FVector(250.0f, 0.0f, 120.0f);
+                        CameraFOV = 55.0f;
+                    }
 
         FActorSpawnParameters CameraParams;
         CameraParams.Name = TEXT("SZTU_ObserverCamera");
@@ -139,19 +191,28 @@ void ASZTUWindFieldGameMode::StartPlay()
                 UE_LOG(LogSZTUWindField, Warning, TEXT("Observer camera spawned but no PlayerController was available."));
             }
         }
-        else
-        {
-            UE_LOG(LogSZTUWindField, Warning, TEXT("Failed to spawn observer camera."));
-        }
+    else
+    {
+        UE_LOG(LogSZTUWindField, Warning, TEXT("Failed to spawn observer camera."));
+    }
     }
     else
     {
         UE_LOG(LogSZTUWindField, Display, TEXT("Observer camera disabled."));
     }
 
-    // Wind control UI disabled — scene runs clean without on-screen text.
-    // Re-enable with -WindUI command line flag if needed.
-    if (FParse::Param(FCommandLine::Get(), TEXT("WindUI")))
+    // Wind control UI:
+    // - Wind scenes (factory-wind, demo) default to ON, suppress with -NoWindUI.
+    // - Other scenes default to OFF, enable with -WindUI.
+    // The on-screen text labels remain hidden; only the UMG slider shows.
+    const FString WindUIMapName = GetWorld() ? GetWorld()->GetMapName() : FString();
+    const bool bWindSceneByDefault =
+        WindUIMapName.Contains(TEXT("WindScene")) ||
+        WindUIMapName.Contains(TEXT("WindFieldDemoScene"));
+    const bool bNoWindUIExplicit = FParse::Param(FCommandLine::Get(), TEXT("NoWindUI"));
+    const bool bWindUIExplicit = FParse::Param(FCommandLine::Get(), TEXT("WindUI"));
+    const bool bEnableWindUI = bWindSceneByDefault ? !bNoWindUIExplicit : bWindUIExplicit;
+    if (bEnableWindUI)
     {
         ASZTUWindFieldActor* RuntimeWindField = nullptr;
         for (TActorIterator<ASZTUWindFieldActor> It(GetWorld()); It; ++It)
@@ -169,8 +230,8 @@ void ASZTUWindFieldGameMode::StartPlay()
                 {
                     WindControlWidget->ConfigureWindField(RuntimeWindField);
                     WindControlWidget->AddToViewport(100);
-                    WindControlWidget->SetDesiredSizeInViewport(FVector2D(420.0f, 130.0f));
-                    WindControlWidget->SetPositionInViewport(FVector2D(24.0f, 24.0f), false);
+                    // 左下角位置：绝不挡视野右上角 + 不被 DPI 缩放裁切
+                    WindControlWidget->SetPositionInViewport(FVector2D(20.0f, 580.0f), false);
 
                     FInputModeGameAndUI InputMode;
                     InputMode.SetHideCursorDuringCapture(false);
@@ -250,4 +311,24 @@ void ASZTUWindFieldGameMode::StartPlay()
             TEXT("Ground color override: RGB(%.0f,%.0f,%.0f) applied to %d component(s)"),
             NewColor.R * 255, NewColor.G * 255, NewColor.B * 255, OverrideCount);
     }
+
+    // The generated maps contain legacy 3D labels that obstruct the vehicle
+    // in the fixed observer view. Hide only world-space TextRender components;
+    // the wind-speed UMG widget remains visible and interactive.
+    int32 HiddenTextCount = 0;
+    for (TActorIterator<AActor> It(GetWorld()); It; ++It)
+    {
+        TArray<UTextRenderComponent*> TextComponents;
+        It->GetComponents<UTextRenderComponent>(TextComponents);
+        for (UTextRenderComponent* TextComponent : TextComponents)
+        {
+            if (!TextComponent) { continue; }
+            TextComponent->SetVisibility(false, true);
+            TextComponent->SetHiddenInGame(true, true);
+            ++HiddenTextCount;
+        }
+    }
+    UE_LOG(LogSZTUWindField, Display,
+        TEXT("Hidden %d world-space text component(s); viewport UI is unchanged"),
+        HiddenTextCount);
 }

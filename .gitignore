@@ -1,0 +1,25 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Runtime state and generated validation output
+task_history.json
+current_task.json
+semantic-runs/
+verification-runs/
+*.log
+
+# Unreal Engine generated directories
+UE/Binaries/
+UE/DerivedDataCache/
+UE/Intermediate/
+UE/Saved/
+UE/.vs/
+
+# Local credentials and environment files
+.env
+.env.*
+*.key
+*.pem

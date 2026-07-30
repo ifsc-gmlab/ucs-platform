@@ -36,6 +36,11 @@ public:
     UFUNCTION(BlueprintCallable, Category = "SITL")
     void SetActuatorCount(int32 Count);
 
+    // 重新初始化 TCP server socket（用当前 ListenPort）。
+    // 用途：Owner Pawn 在 BeginPlay 改了 ListenPort 之后调一次让 socket 重新 bind。
+    UFUNCTION(BlueprintCallable, Category = "SITL")
+    void ReinitServerSocket();
+
     // 发送无人机状态给 PX4（位置/速度/姿态/角速度，单位：米、米/秒、弧度）
     void SendDroneState(const FVector& PositionM, const FVector& VelocityMps,
                         const FQuat& Attitude, const FVector& BodyAngularVelocityRadS,
@@ -85,6 +90,9 @@ private:
     // PX4 发送 HIL_ACTUATOR_CONTROLS 时的时间戳（用于 lockstep 同步）
     uint64_t Px4TimeUsec = 0;
 
+    // 仿真单调时钟（每个 SITLComponent 实例独立，避免双机共享 static 导致时序混乱）
+    uint64_t TimeUsec = 0;
+
     // lockstep：收到 HIL_ACTUATOR_CONTROLS 后需要立即回复 HIL_SENSOR
     bool bForceSendSensor = false;
 
@@ -92,4 +100,7 @@ private:
     float TimeSinceLastRecv = 0.f;
     UPROPERTY(EditAnywhere, Category = "SITL")
     float ConnectionTimeoutSec = 30.f;
+
+    // HIL 调试 CSV 文件句柄（每实例独立，避免双机写同一个文件冲突）
+    FILE* DebugFile = nullptr;
 };

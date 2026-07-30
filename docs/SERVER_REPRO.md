@@ -45,7 +45,7 @@ Windows 侧：
 - UE 项目，默认路径假设：`D:\SZTUWindFieldPX4Demo\Unreal\SZTUWindFieldPX4Demo.uproject`
 - PowerShell 5.1+
 - Python，可运行 `outputs\listen_telem_long.py` 和 `outputs\analyze_flight_run.py`
-- QGroundControl，建议路径：`C:\QGroundControl\bin\QGroundControl.exe`
+- IFSC Station，标准路径：`C:\IFSC-Station\IFSC-Station.exe`
 - 防火墙允许：
   - TCP `4560`：UE simulator port，PX4 连接 UE；
   - UDP `14550`：QGC 接收 PX4 遥测。

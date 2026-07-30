@@ -1,0 +1,14 @@
+diff --git a/src/modules/mavlink/mavlink_command_params.hpp b/src/modules/mavlink/mavlink_command_params.hpp
+--- a/src/modules/mavlink/mavlink_command_params.hpp
++++ b/src/modules/mavlink/mavlink_command_params.hpp
+@@ -197,7 +197,8 @@ struct VehicleOverride {
+ // When adding vehicle-specific param differences, add entries here.
+ static constexpr VehicleOverride VehicleParamOverrides[] = {
+-	// NAV_TAKEOFF: p1 (minimum pitch angle) is used by FW and VTOL-FW; not applicable to MC.
+-	{ 22, VEHICLE_FW | VEHICLE_VTOL, 0x01, 0x01 },
++	// NAV_TAKEOFF: p1 is used by FW/VTOL and is harmless when ignored by MC.
++	// QGC 5.0.x sends -1 here for guided MC takeoff, so accept it at the MAVLink boundary.
++	{ 22, VEHICLE_FW | VEHICLE_MC | VEHICLE_VTOL, 0x01, 0x01 },
+ };
+
+ // Binary search + vehicle override lookup. Returns the adjusted mask, or -1 if cmd not in table.

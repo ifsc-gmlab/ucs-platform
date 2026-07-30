@@ -21,6 +21,7 @@ import socket
 import time
 import argparse
 import math
+import glob
 from pymavlink import mavutil
 
 MAV = mavutil.mavlink
@@ -66,11 +67,19 @@ def connect():
             continue
         for msg in parse_buf(mav, data):
             if msg.get_type() == "HEARTBEAT":
+                # filter out QGC heartbeat, only accept PX4 heartbeat
+                # PX4: type=QUADROTOR(2) autopilot=PX4(12)
+                # QGC: type=GCS(6) autopilot=INVALID(0)
+                if msg.type == MAV.MAV_TYPE_GCS or msg.autopilot != MAV.MAV_AUTOPILOT_PX4:
+                    continue
                 sys_id = msg.get_srcSystem()
                 comp_id = msg.get_srcComponent()
         if sys_id is None and len(data) >= 7 and data[0] == 0xFD:
-            sys_id = data[5]
-            comp_id = data[6]
+            # Fallback: parse raw bytes, but only accept if not QGC sys_id=255
+            raw_sys_id = data[5]
+            if raw_sys_id != 255:
+                sys_id = raw_sys_id
+                comp_id = data[6]
         if sys_id:
             break
     if not sys_id:
@@ -180,8 +189,11 @@ def read_posz_from_csv():
     out-of-band ground-truth check because PX4's LOCAL_POSITION_NED stream is not
     visible on this script's command port. Returns (posz, motors_avg) or None."""
     import os
-    for p in ("/mnt/c/tmp/hil_debug.csv", "/c/tmp/hil_debug.csv",
-             "C:/tmp/hil_debug.csv", "/tmp/hil_debug.csv"):
+    candidates = ["/mnt/c/tmp/hil_debug.csv", "/c/tmp/hil_debug.csv",
+                  "C:/tmp/hil_debug.csv", "/tmp/hil_debug.csv"]
+    candidates.extend(sorted(glob.glob("/mnt/c/tmp/hil_debug_*.csv"),
+                             key=lambda path: os.path.getmtime(path), reverse=True))
+    for p in candidates:
         if not os.path.exists(p):
             continue
         try:
@@ -308,8 +320,9 @@ def retry_clean_disarm(sock, mav, mav_cmd, sys_id, comp_id, hb, x, y, attempts=4
 
 
 def disarm(sock, mav, mav_cmd, sys_id, comp_id, hb, force=False, confirm=True):
-    """Send DISARM. If confirm=True, watch for the ARM_DISARM COMMAND_ACK and
-    return True only if result==0 (actually disarmed)."""
+    """Send DISARM. If confirm=True, accept either a successful ARM_DISARM ACK
+    or a HEARTBEAT whose armed bit is clear. PX4 can apply the command while the
+    corresponding ACK is lost among high-rate HIL traffic."""
     print("[*] DISARM%s ..." % (" (force)" if force else ""))
     # MAV_CMD_COMPONENT_ARM_DISARM uses the magic value 21196 for force disarm.
     # param2=1 is not a force-disarm request and PX4 keeps rejecting it as
@@ -335,6 +348,9 @@ def disarm(sock, mav, mav_cmd, sys_id, comp_id, hb, force=False, confirm=True):
                     else:
                         print("[!] disarm ACK result=%s" % m.result)
                         return False
+                if m.get_type() == "HEARTBEAT" and not is_armed(m):
+                    print("[*] disarmed (HEARTBEAT armed bit cleared)")
+                    return True
         except socket.timeout:
             pass
     print("[!] no disarm ACK within 3s")
@@ -365,7 +381,14 @@ def main():
                     help="seconds spent on the circle")
     ap.add_argument("--circle-entry", type=float, default=3.0,
                     help="seconds used to enter and leave the circle")
+    ap.add_argument("--instance", type=int, default=1,
+                    help="PX4 instance id (1=port 18570, 2=18571, ...)")
     args = ap.parse_args()
+
+    # 双机并行：按 --instance 调整 PX4 端口
+    global PX4_ADDR
+    PX4_ADDR = ("127.0.0.1", 18570 + args.instance - 1)
+    print(f"[*] instance={args.instance} → PX4_ADDR={PX4_ADDR}")
 
     circle_enabled = args.circle_radius > 0.0 or args.circle_duration > 0.0
     if circle_enabled and (args.circle_radius <= 0.0 or args.circle_duration <= 0.0 or args.circle_laps <= 0.0):

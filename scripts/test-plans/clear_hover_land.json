@@ -1,0 +1,16 @@
+{
+  "steps": [
+    {
+      "action": "fly_to",
+      "goal_id": "inspection_gate",
+      "vision": false
+    },
+    {
+      "action": "hover",
+      "seconds": 3
+    },
+    {
+      "action": "land"
+    }
+  ]
+}

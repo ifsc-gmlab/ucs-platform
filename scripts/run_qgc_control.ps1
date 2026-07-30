@@ -1,17 +1,18 @@
 #requires -version 5.1
 [CmdletBinding()]
 param(
-  [ValidateSet("no-wind", "wind", "hex", "rover")]
+  [ValidateSet("no-wind", "factory", "factory-wind", "wind", "urban", "hex", "rover")]
   [string]$Scene = "no-wind",
   [int]$SessionSeconds = 900,
   [string]$Distro = "Ubuntu",
-  [string]$QgcPath = "C:\QGroundControl\bin\QGroundControl.exe",
+  [string]$QgcPath = "C:\IFSC-Station\IFSC-Station.exe",
   [ValidateRange(0, 120)]
   [int]$EstimatorSettleSec = 35,
   [ValidateRange(0.1, 5.0)]
   [double]$Ekf2AblLim = 5.0,
   [ValidateRange(-1.0, 30.0)]
   [double]$WindMps = -1.0,
+  [switch]$WindUI,
   [switch]$RestartQGC,
   [switch]$DryRun
 )
@@ -24,7 +25,10 @@ $QgcLauncher = Join-Path $Root "outputs\start_px4_ue_qgc_control.sh"
 $RelayScript = Join-Path $Root "outputs\mavlink_relay.py"
 $RoverAirframe = Join-Path $Root "outputs\px4_airframes\51001_none_rover_ackermann"
 $Map = switch ($Scene) {
+  "factory" { "/Game/Maps/SZTUFactoryFlightScene" }
+  "factory-wind" { "/Game/Maps/SZTUFactoryWindScene" }
   "wind" { "/Game/Maps/SZTUWindFieldDemoScene" }
+  "urban" { "/Game/Maps/SZTUUrbanSemanticScene" }
   "hex" { "/Game/Maps/SZTUHexacopterScene" }
   "rover" { "/Game/Maps/SZTURoverScene" }
   default { "/Game/Maps/SZTUFlightPatternsScene" }
@@ -35,7 +39,7 @@ $Vehicle = switch ($Scene) {
   default { "quad" }
 }
 $EffectiveWindMps = $WindMps
-if ($Scene -eq "wind" -and -not $PSBoundParameters.ContainsKey("WindMps")) {
+if ($Scene -in @("wind", "factory-wind") -and -not $PSBoundParameters.ContainsKey("WindMps")) {
   $EffectiveWindMps = 8.0
 }
 
@@ -60,6 +64,12 @@ function Sync-WslLauncher {
   }
 }
 
+function Get-GroundStationProcesses {
+  @(
+    Get-Process -Name "IFSC-Station", "QGroundControl" -ErrorAction SilentlyContinue
+  )
+}
+
 if ($SessionSeconds -lt 60) {
   throw "SessionSeconds must be at least 60"
 }
@@ -77,8 +87,9 @@ if (-not $DryRun) {
 
 Write-Host "[qgc-control] scene=$Scene map=$Map session=${SessionSeconds}s"
 Write-Host "[qgc-control] vehicle=$Vehicle"
-Write-Host "[qgc-control] OFFBOARD flight script is disabled; QGC owns flight commands"
-Write-Host "[qgc-control] estimator settle=${EstimatorSettleSec}s ABL_LIM=$Ekf2AblLim wind=${EffectiveWindMps}m/s before QGC opens"
+Write-Host "[qgc-control] OFFBOARD flight script is disabled; IFSC Station owns flight commands"
+Write-Host "[qgc-control] estimator settle=${EstimatorSettleSec}s ABL_LIM=$Ekf2AblLim wind=${EffectiveWindMps}m/s before IFSC Station opens"
+Write-Host "[qgc-control] wind UI=$WindUI"
 
 $verifyParams = @{
   Map = $Map
@@ -95,6 +106,7 @@ $verifyParams = @{
   Ekf2AblLim = $Ekf2AblLim
   MpcThrHover = if ($Vehicle -eq "hex") { 0.50 } else { 0.62 }
   WindMps = $EffectiveWindMps
+  WindUI = $WindUI
   DryRun = $DryRun
 }
 
@@ -109,36 +121,56 @@ if ($DryRun) {
 }
 
 if ($RestartQGC) {
-  $existing = @(Get-Process QGroundControl -ErrorAction SilentlyContinue)
+  $existing = @(Get-GroundStationProcesses)
   foreach ($process in $existing) {
     [void]$process.CloseMainWindow()
   }
   Start-Sleep -Seconds 3
-  Get-Process QGroundControl -ErrorAction SilentlyContinue |
-    Stop-Process -Force -ErrorAction SilentlyContinue
+  $remaining = @(Get-GroundStationProcesses)
+  foreach ($process in $remaining) {
+    Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+    try {
+      $process.WaitForExit(5000)
+    }
+    catch {
+      # A process that exited between discovery and WaitForExit is already clean.
+    }
+  }
+  Start-Sleep -Seconds 1
 }
 
-if (-not (Get-Process QGroundControl -ErrorAction SilentlyContinue)) {
+if (@(Get-GroundStationProcesses).Count -eq 0) {
   if (-not (Test-Path -LiteralPath $QgcPath)) {
-    throw "QGroundControl not found: $QgcPath"
+    throw "IFSC Station not found: $QgcPath"
   }
   Start-Process -FilePath $QgcPath
-  Start-Sleep -Seconds 5
 }
 
-$listener = Get-NetUDPEndpoint -LocalPort 14550 -ErrorAction SilentlyContinue
+$listener = $null
+$groundStationDeadline = (Get-Date).AddSeconds(30)
+do {
+  $groundStationPids = @(Get-GroundStationProcesses | Select-Object -ExpandProperty Id)
+  $listener = Get-NetUDPEndpoint -LocalPort 14550 -ErrorAction SilentlyContinue |
+    Where-Object { $_.OwningProcess -in $groundStationPids } |
+    Select-Object -First 1
+  if ($listener) {
+    break
+  }
+  Start-Sleep -Milliseconds 500
+} while ((Get-Date) -lt $groundStationDeadline)
+
 if ($listener) {
-  Write-Host "[qgc-control] QGC UDP 14550 listener detected"
+  Write-Host "[qgc-control] IFSC Station UDP 14550 listener detected"
 }
 else {
-  Write-Warning "QGC is not listening on UDP 14550 yet"
+  throw "IFSC Station did not acquire UDP 14550 within 30 seconds"
 }
 
 if ($Vehicle -eq "rover") {
-  Write-Host "[qgc-control] ready: arm in QGC, then use the virtual joystick (throttle + steering)"
+  Write-Host "[qgc-control] ready: arm in IFSC Station, then use the virtual joystick (throttle + steering)"
 }
 else {
-  Write-Host "[qgc-control] ready: wait for QGC 'Ready to Fly', then use Fly > Takeoff"
+  Write-Host "[qgc-control] ready: wait for IFSC Station 'Ready to Fly', then use Fly > Takeoff"
 }
 Write-Host "[qgc-control] PID trials: one takeoff per fresh UE/PX4 session; restart after landing"
-Write-Host "[qgc-control] normal stop: Land in QGC before running outputs\px4_emergency_stop.ps1 -KillSim"
+Write-Host "[qgc-control] normal stop: Land in IFSC Station before running outputs\px4_emergency_stop.ps1 -KillSim"

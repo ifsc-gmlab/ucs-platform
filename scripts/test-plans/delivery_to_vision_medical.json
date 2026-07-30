@@ -1,0 +1,17 @@
+{
+  "steps": [
+    {
+      "action": "fly_to",
+      "goal_id": "delivery_zone",
+      "vision": false
+    },
+    {
+      "action": "fly_to",
+      "goal_id": "medical_station",
+      "vision": true
+    },
+    {
+      "action": "land"
+    }
+  ]
+}

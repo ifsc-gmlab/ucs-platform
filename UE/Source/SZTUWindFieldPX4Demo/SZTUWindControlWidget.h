@@ -27,5 +27,5 @@ private:
     TWeakObjectPtr<ASZTUWindFieldActor> WindField;
     TSharedPtr<STextBlock> WindSpeedLabel;
     FSliderStyle LargeSliderStyle;
-    float MaxWindSpeedMps = 20.0f;
+    float MaxWindSpeedMps = 15.0f;
 };

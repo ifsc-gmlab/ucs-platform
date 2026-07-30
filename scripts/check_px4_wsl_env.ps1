@@ -3,6 +3,7 @@
 param(
   [string]$Distro = "Ubuntu",
   [string]$Px4Root = "~/PX4-Autopilot",
+  [string]$ExpectedPx4Revision = "a86306a146c9dd1e33a7677fb7f5a855bf2c1c9f",
   [string]$ReportPath = ""
 )
 
@@ -31,7 +32,7 @@ function Invoke-WslCheck {
 
 $ubuntu = Invoke-WslCheck "lsb_release -ds"
 $repo = Invoke-WslCheck "test -d $Px4Root"
-$revision = Invoke-WslCheck "git -C $Px4Root rev-parse --short HEAD"
+$revision = Invoke-WslCheck "git -C $Px4Root rev-parse HEAD"
 $branch = Invoke-WslCheck "git -C $Px4Root status --short --branch | head -1"
 $submodules = Invoke-WslCheck "if git -C $Px4Root submodule status --recursive | grep -q '^-'; then exit 1; fi"
 $binary = Invoke-WslCheck "test -x $Px4Root/build/px4_sitl_default/bin/px4"
@@ -42,6 +43,7 @@ $checks = [ordered]@{
   "Ubuntu available" = $ubuntu.Ok
   "PX4 repository in WSL filesystem" = $repo.Ok
   "PX4 git revision readable" = $revision.Ok
+  "PX4 revision matches pinned commit" = $revision.Ok -and ($revision.Text.Trim().ToLowerInvariant() -eq $ExpectedPx4Revision.ToLowerInvariant())
   "PX4 recursive submodules initialized" = $submodules.Ok
   "px4_sitl binary built" = $binary.Ok
   "pymavlink importable" = $pymavlink.Ok
@@ -57,6 +59,7 @@ $lines = @(
   "- Ubuntu: $($ubuntu.Text)",
   "- PX4 root: $Px4Root",
   "- PX4 revision: $($revision.Text)",
+  "- Expected PX4 revision: $ExpectedPx4Revision",
   "- PX4 branch: $($branch.Text)",
   "- Windows host gateway: $($hostIp.Text)",
   "- Overall: $(if ($allOk) { 'PASS' } else { 'CHECK' })",
