@@ -7,7 +7,7 @@
 1. 多传感器避障：UE 前/左/右三组射线扇区和下视测距提供实时距离；PX4 负责姿态与高度闭环；WSL 高层控制器根据距离修正水平速度。
 2. 语义驱动：操作入口接收 `delivery_zone`、`medical_station` 等语义名称，从 `outputs/urban_semantic_map.json` 解析目标坐标并执行任务，而不是直接要求操作者填写 X/Y。
 
-机载相机已挂在无人机前部。UE 默认观察相机从场景 `+Y` 侧看向 `-Y`；网页地图采用相同上下方向，并显示两排 10 栋建筑和中央障碍。网页右下角同时显示机载相机实时画面。UE 通过 `Saved/CameraFrames/current_run.txt` 标记当前运行目录，网页只读取该目录的 8 个环形帧，避免扫描历史截图。添加 `-OnboardCamera` 仍可让 UE 主窗口切换为第一视角。
+机载相机已挂在无人机前部。UE、PX4、路线规划器、任务命令和原始遥测始终使用原有内部坐标，不做重映射；网页显示层统一使用 `显示 X = 内部 X`、`显示 Y = -内部 Y`、`显示偏航 = -内部偏航`。因此后续修改页面朝向或标签时不需要重写飞行与规划逻辑。网页地图显示两排 10 栋建筑和中央障碍，右下角同时显示机载相机实时画面。UE 通过 `Saved/CameraFrames/current_run.txt` 标记当前运行目录，网页只读取该目录的 8 个环形帧，避免扫描历史截图。添加 `-OnboardCamera` 仍可让 UE 主窗口切换为第一视角。
 
 控制器在水平飞行时会根据速度向量设置偏航角，使机头、机载相机和前向测距扇区与实际飞行方向一致；悬停时保持当前航向。语义区域在 UE 中使用无碰撞的空心地面标识，不再生成有厚度的实体色块。
 
@@ -40,6 +40,22 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\outputs\run_semantic_city.
 powershell -NoProfile -ExecutionPolicy Bypass -File .\outputs\run_semantic_city.ps1 -DryRun
 ```
 
+## 回归任务集
+
+一次执行 `outputs/test-plans` 内的全部语义任务：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\outputs\run_semantic_regression.ps1
+```
+
+首次使用或只修改网页、文档、调度逻辑时，先运行不启动 UE/PX4 的检查：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\outputs\run_semantic_regression.ps1 -DryRun
+```
+
+可通过 `-PlanNames clear_hover_land,multi_goal_return` 只选择部分计划；默认遇到首个失败即停止，添加 `-ContinueOnFailure` 后会继续执行剩余计划。每次执行会在 `outputs/semantic-regression/<run-id>` 生成总表、JSON 结果和每个计划的独立日志。
+
 ## 信息流
 
 ```mermaid
@@ -64,7 +80,7 @@ flowchart LR
 - `controller.log`：语义解析、绕障决策和导航过程。
 - `px4_sitl.log`：PX4 起飞、模式与降落证据。
 
-PASS 必须同时满足：到达语义目标、至少存在一个地图规划绕行点或传感器避障事件、障碍碰撞为 0、感知样本不少于 20、正常落地并解除锁定。
+PASS 必须同时满足：到达语义目标、障碍碰撞为 0、感知样本不少于 20、正常落地并解除锁定。只有路线确实穿越已知障碍或传感器检测到突发障碍时，才额外要求存在规划绕行点或传感器避障证据；无障碍直达航段不为了“展示避障”而人为制造绕行动作。
 
 ## 地图重建
 

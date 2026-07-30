@@ -182,7 +182,15 @@ check("map explicitly labels positive Y upward",
 check("map uses conventional positive-Y-up transform",
       "function w2s(x,y){return [ox+x*scale,oy+y*scale];}" in dd.DASHBOARD_HTML and
       "function d2s(x,y){return [ox+x*scale,oy-y*scale];}" in dd.DASHBOARD_HTML and
-      "return [localX,-localY];" in dd.DASHBOARD_HTML)
+      "return [x||0,-(y||0)];" in dd.DASHBOARD_HTML and
+      "return mapLocalToDisplayXY(localX,localY);" in dd.DASHBOARD_HTML)
+check("display transforms are centralized and display-only",
+      "function mapLocalToDisplayXY(x,y)" in dd.DASHBOARD_HTML and
+      "function mapDisplayVectorXY(x,y)" in dd.DASHBOARD_HTML and
+      "function mapDisplayYawDeg(yaw)" in dd.DASHBOARD_HTML and
+      "Never feed these values back to UE, PX4" in dd.DASHBOARD_HTML and
+      "mapDisplayVectorXY(t.velocity_x_mps,t.velocity_y_mps)" in dd.DASHBOARD_HTML and
+      "mapDisplayYawDeg(t.yaw_deg)" in dd.DASHBOARD_HTML)
 check("map preserves UE heading after display-coordinate conversion",
       "ctx.rotate(yaw)" in dd.DASHBOARD_HTML)
 

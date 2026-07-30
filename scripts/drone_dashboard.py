@@ -1684,20 +1684,35 @@ function mapLocalXY(x,y){
   return [(x||0)-(origin[0]||0),(y||0)-(origin[1]||0)];
 }
 
+// Display-only coordinate helpers. Never feed these values back to UE, PX4,
+// the route planner, mission commands, or recorded telemetry.
+function mapLocalToDisplayXY(x,y){
+  return [x||0,-(y||0)];
+}
+
+function mapDisplayVectorXY(x,y){
+  return [x||0,-(y||0)];
+}
+
+function mapDisplayYawDeg(yaw){
+  return -(yaw||0);
+}
+
 function mapDisplayXY(x,y){
   const [localX,localY]=mapLocalXY(x,y);
-  return [localX,-localY];
+  return mapLocalToDisplayXY(localX,localY);
 }
 
 function updateStatus(t){
   document.getElementById('s-conn').innerHTML='<span class="indicator on"></span>在线';
   document.getElementById('s-time').textContent=fmt(t.time_s,1)+'s';
   const [displayX,displayY]=mapDisplayXY(t.position_x_m,t.position_y_m);
+  const [displayVx,displayVy]=mapDisplayVectorXY(t.velocity_x_mps,t.velocity_y_mps);
   document.getElementById('s-pos').textContent=`(${fmt(displayX)},${fmt(displayY)},${fmt(t.position_z_m)})`;
-  document.getElementById('s-vel').textContent=`(${fmt(t.velocity_x_mps)},${fmt(-(t.velocity_y_mps||0))},${fmt(t.velocity_z_mps)})`;
+  document.getElementById('s-vel').textContent=`(${fmt(displayVx)},${fmt(displayVy)},${fmt(t.velocity_z_mps)})`;
   document.getElementById('s-roll').textContent=fmt(t.roll_deg);
   document.getElementById('s-pitch').textContent=fmt(t.pitch_deg);
-  document.getElementById('s-yaw').textContent=fmt(-(t.yaw_deg||0));
+  document.getElementById('s-yaw').textContent=fmt(mapDisplayYawDeg(t.yaw_deg));
   document.getElementById('s-wind').textContent=fmt(t.wind_speed_mps);
   document.getElementById('s-zone').textContent=ZONE_NAMES[t.semantic_zone]||t.semantic_zone||'--';
   document.getElementById('s-rf').textContent=fmt(t.range_front_m);
@@ -1768,7 +1783,8 @@ function drawMap(t){
       ctx.fillStyle='#333';ctx.font='11px sans-serif';ctx.textAlign='center';
       ctx.fillText(ZONE_NAMES[id]||g.label,sx,sy-15);
       ctx.font='9px monospace';ctx.fillStyle='#888';
-      ctx.fillText(`(${g.position_m[0]},${-g.position_m[1]})`,sx,sy+22);
+      const [goalDisplayX,goalDisplayY]=mapLocalToDisplayXY(g.position_m[0],g.position_m[1]);
+      ctx.fillText(`(${goalDisplayX},${goalDisplayY})`,sx,sy+22);
     });
   }
   if(t&&t.position_x_m!==undefined){
