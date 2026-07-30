@@ -178,7 +178,8 @@ $rawCommit = @(
 $rawPath = Join-Path ([IO.Path]::GetTempPath()) ("github-api-commit-{0}.txt" -f [Guid]::NewGuid().ToString("N"))
 try {
   [IO.File]::WriteAllText($rawPath, $rawCommit, [Text.UTF8Encoding]::new($false))
-  $localApiSha = (Invoke-Git hash-object -t commit -w $rawPath).Trim()
+  $localApiSha = (& git hash-object -t commit -w -- $rawPath).Trim()
+  if ($LASTEXITCODE -ne 0) { throw "Cannot write reconstructed API commit object" }
 } finally {
   Remove-Item -LiteralPath $rawPath -Force -ErrorAction SilentlyContinue
 }
