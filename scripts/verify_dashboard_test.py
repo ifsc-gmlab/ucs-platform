@@ -1,4 +1,4 @@
-import copy, importlib.util, os, tempfile, time, sys
+import copy, importlib.util, json, os, tempfile, time, sys
 from semantic_mission_verdict import evaluate_mission_result
 from semantic_route_planner import (
     DEFAULT_CLEARANCE_M, plan_safe_route, segment_is_clear)
@@ -21,6 +21,24 @@ check("_decode_bytes utf-16le", dd._decode_bytes(utf16) == "启动 UE 中文测�
 utf8 = "启动 UE 中文测试".encode("utf-8")
 check("_decode_bytes utf-8", dd._decode_bytes(utf8) == "启动 UE 中文测试")
 check("_decode_bytes empty", dd._decode_bytes(b"") == "")
+
+# Map switching remains data-driven and fail-closed.
+with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", encoding="utf-8", delete=False) as map_file:
+    json.dump({
+        "ue_map": "/Game/Maps/AlternateSemanticMap",
+        "goals": {"alternate_pad": {"position_m": [1, 2]}},
+    }, map_file)
+    alternate_map_path = map_file.name
+try:
+    alternate_goals, alternate_ue_map = dd.load_map_dispatch_config(
+        alternate_map_path)
+    check("alternate map goals become whitelist",
+          alternate_goals == {"alternate_pad"})
+    check("alternate map selects UE asset",
+          alternate_ue_map == "/Game/Maps/AlternateSemanticMap")
+finally:
+    os.unlink(alternate_map_path)
 
 # 2) _stage_for_line
 check("stage startup", dd._stage_for_line("[semantic-city] run dir: x") == 0)

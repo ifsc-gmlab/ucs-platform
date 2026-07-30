@@ -44,6 +44,7 @@ from semantic_route_planner import (
     intersected_obstacle_ids,
     plan_safe_route,
 )
+from semantic_runtime_config import load_runtime_config
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import parse_qs
 
@@ -75,11 +76,28 @@ def _decode_bytes(raw):
 DEFAULT_PORT = 8080
 DEFAULT_TELEMETRY_PORT = 14660
 DEFAULT_MAP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "urban_semantic_map.json")
+DEFAULT_UE_MAP = ""
+RUNTIME_CONFIG = load_runtime_config()
+CAMERA_PREVIEW_POLL_MS = int(
+    RUNTIME_CONFIG["camera"]["preview_poll_ms"])
+CAMERA_STALE_AFTER_SEC = float(
+    RUNTIME_CONFIG["camera"]["stale_after_s"])
+
+def load_map_dispatch_config(path):
+    """Load a fail-closed goal whitelist and matching UE map from map data."""
+    with open(path, "r", encoding="utf-8-sig") as map_file:
+        data = json.load(map_file)
+    goals = data.get("goals")
+    ue_map = str(data.get("ue_map", "")).strip()
+    if not isinstance(goals, dict) or not goals:
+        raise ValueError("semantic map has no dispatchable goals")
+    if not re.fullmatch(r"/Game/[A-Za-z0-9_./-]+", ue_map) or ".." in ue_map:
+        raise ValueError("semantic map has an invalid ue_map asset path")
+    return set(str(goal_id) for goal_id in goals), ue_map
+
 
 # Strict whitelist of goal ids the dashboard is allowed to dispatch.
-GOAL_WHITELIST = {
-    "start_pad", "inspection_gate", "delivery_zone", "medical_station",
-}
+GOAL_WHITELIST, DEFAULT_UE_MAP = load_map_dispatch_config(DEFAULT_MAP)
 # WSL-side controller + camera artifact locations (fixed, not user-supplied).
 WSL_DISTRO = "Ubuntu"
 WSL_CONTROLLER_DIR = "~/szefitl"
@@ -363,6 +381,9 @@ def parse_plan_with_deepseek(text):
 3. 视觉、识别、相机确认只作用于用户明确要求视觉确认的飞行步骤。
 4. 如果用户要求最终降落，最后一步必须是 land。
 5. 不得创造新地点、动作、参数，不输出解释或 Markdown。"""
+    system_prompt = system_prompt.replace(
+        "start_pad|inspection_gate|delivery_zone|medical_station",
+        "|".join(sorted(GOAL_WHITELIST)))
     payload = {
         "model": DEEPSEEK_MODEL,
         "messages": [
@@ -424,6 +445,9 @@ def parse_command_with_deepseek(text):
 2. 只有 action=fly_to 时 goal_id 才能是地点，否则必须为 null。
 3. 用户要求看、视觉、识别、相机确认时 vision=true。
 4. 不得创造其他动作或地点，不得输出解释、Markdown 或控制参数。"""
+    system_prompt = system_prompt.replace(
+        "start_pad|inspection_gate|delivery_zone|medical_station",
+        "|".join(sorted(GOAL_WHITELIST)))
     payload = {
         "model": DEEPSEEK_MODEL,
         "messages": [
@@ -632,6 +656,8 @@ def run_controller_task(task_id, goal_id, vision, plan=None):
             POWERSHELL_EXE, "-NoProfile", "-ExecutionPolicy", "Bypass",
             "-File", SEMANTIC_WRAPPER_PATH,
             "-Goal", goal_id,
+            "-SemanticMapFile", DEFAULT_MAP,
+            "-UeMap", DEFAULT_UE_MAP,
             "-MissionTimeoutSec", "70",
             "-EstimatorSettleSec", "35",
         ]
@@ -1672,9 +1698,9 @@ function refreshOnboardPreview(){
     img.style.display='none';
     empty.style.display='flex';
   };
-  probe.src='/api/camera/latest?t='+Date.now();
+  probe.src='/api/camera/latest';
 }
-setInterval(refreshOnboardPreview,1000);
+setInterval(refreshOnboardPreview,__CAMERA_PREVIEW_POLL_MS__);
 refreshOnboardPreview();
 
 function fmt(v,d=1){return v!==undefined?v.toFixed(d):'--';}
@@ -2035,10 +2061,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/":
+            dashboard_html = DASHBOARD_HTML.replace(
+                "__CAMERA_PREVIEW_POLL_MS__",
+                str(CAMERA_PREVIEW_POLL_MS))
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
-            self.wfile.write(DASHBOARD_HTML.encode("utf-8"))
+            self.wfile.write(dashboard_html.encode("utf-8"))
         elif self.path == "/api/telemetry":
             with telemetry_lock:
                 data = json.dumps(latest_telemetry)
@@ -2076,9 +2105,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         latest = candidate
                         latest_mtime = mtime
             # Do not present a frame from an old mission as a live camera.
-            if latest is None or time.time() - latest_mtime > 5.0:
+            if latest is None or time.time() - latest_mtime > CAMERA_STALE_AFTER_SEC:
                 self.send_response(404)
                 self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                return
+            stat = os.stat(latest)
+            etag = '"%x-%x"' % (stat.st_mtime_ns, stat.st_size)
+            if self.headers.get("If-None-Match") == etag:
+                self.send_response(304)
+                self.send_header("ETag", etag)
+                self.send_header("Cache-Control", "no-cache")
                 self.end_headers()
                 return
             try:
@@ -2090,7 +2127,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
             self.send_response(200)
             self.send_header("Content-Type", "image/png")
-            self.send_header("Cache-Control", "no-store, max-age=0")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("ETag", etag)
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
             self.wfile.write(payload)
@@ -2333,21 +2371,29 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 
 def main():
-    global DEFAULT_MAP
+    global DEFAULT_MAP, DEFAULT_UE_MAP, GOAL_WHITELIST
     import argparse
     parser = argparse.ArgumentParser(description="SZTU Drone Dashboard")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--telemetry-port", type=int, default=DEFAULT_TELEMETRY_PORT)
     parser.add_argument("--map", type=str, default=DEFAULT_MAP)
+    parser.add_argument("--ue-map", type=str, default="",
+                        help="optional override; defaults to semantic JSON ue_map")
     args = parser.parse_args()
 
     DEFAULT_MAP = os.path.abspath(args.map)
+    GOAL_WHITELIST, map_ue_map = load_map_dispatch_config(DEFAULT_MAP)
+    DEFAULT_UE_MAP = args.ue_map or map_ue_map
+    if (not re.fullmatch(r"/Game/[A-Za-z0-9_./-]+", DEFAULT_UE_MAP)
+            or ".." in DEFAULT_UE_MAP):
+        parser.error("invalid --ue-map asset path")
 
     # Start UDP telemetry listener in background thread
     t = threading.Thread(target=telemetry_listener, args=(args.telemetry_port,), daemon=True)
     t.start()
     print(f"[dashboard] telemetry listener on UDP {args.telemetry_port}")
     print(f"[dashboard] map file: {args.map}")
+    print(f"[dashboard] UE map: {DEFAULT_UE_MAP}")
 
     # ThreadingHTTPServer so a long controller run never blocks telemetry polling.
     server = ThreadingHTTPServer(("127.0.0.1", args.port), DashboardHandler)

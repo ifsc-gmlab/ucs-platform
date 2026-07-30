@@ -934,6 +934,16 @@ void ASZTUDronePawn::SetupVisionCapture()
         VisionGimbalPitchDeg = GimbalOverride;
     }
 
+    // Keep the default conservative, but allow the dashboard/regression
+    // wrapper to request a modestly fresher preview. The upper bound protects
+    // the HIL loop from excessive synchronous GPU readback.
+    float CaptureHzOverride = 0.0f;
+    if (FParse::Value(FCommandLine::Get(), TEXT("VisionCaptureHz="), CaptureHzOverride))
+    {
+        CaptureHzOverride = FMath::Clamp(CaptureHzOverride, 0.5f, 4.0f);
+        VisionCaptureIntervalSec = 1.0f / CaptureHzOverride;
+    }
+
     if (!bVisionCaptureEnabled || !VisionCapture) { return; }
 
     // The generated urban map owns exact-position, hollow ground logos with

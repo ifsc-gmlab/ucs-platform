@@ -49,8 +49,49 @@ void ASZTUWindFieldGameMode::InitGame(const FString& MapName, const FString& Opt
 
 void ASZTUWindFieldGameMode::StartPlay()
 {
+    if (!GetWorld())
+    {
+        Super::StartPlay();
+        return;
+    }
+
+    // The urban semantic map intentionally has no wind actor by default.
+    // Inject one only for an explicit semantic-wind regression. Keep its
+    // 3200-cell fan visualization hidden so it cannot obstruct the city map;
+    // the actor still provides the same sampled wind model to the drone.
+    float SemanticWindMps = 0.0f;
+    if (FParse::Param(FCommandLine::Get(), TEXT("SemanticWind")) &&
+        FParse::Value(FCommandLine::Get(), TEXT("WindMps="), SemanticWindMps))
+    {
+        ASZTUWindFieldActor* RuntimeWindField = nullptr;
+        for (TActorIterator<ASZTUWindFieldActor> It(GetWorld()); It; ++It)
+        {
+            RuntimeWindField = *It;
+            break;
+        }
+        if (!RuntimeWindField)
+        {
+            FActorSpawnParameters Params;
+            Params.Name = TEXT("SZTU_SemanticRegressionWind");
+            RuntimeWindField = GetWorld()->SpawnActor<ASZTUWindFieldActor>(
+                ASZTUWindFieldActor::StaticClass(), FVector::ZeroVector,
+                FRotator::ZeroRotator, Params);
+        }
+        if (RuntimeWindField)
+        {
+            RuntimeWindField->bShowFanArray = false;
+            RuntimeWindField->bShowWindArrows = false;
+            RuntimeWindField->SetActorHiddenInGame(true);
+            RuntimeWindField->SetRuntimeWindSpeedMps(SemanticWindMps);
+            UE_LOG(LogSZTUWindField, Display,
+                TEXT("Semantic regression wind enabled: %.2f m/s (visualization hidden)"),
+                SemanticWindMps);
+        }
+    }
+
+    // Start player/pawn BeginPlay only after the optional runtime wind actor
+    // exists, so ASZTUDronePawn resolves and caches the correct field.
     Super::StartPlay();
-    if (!GetWorld()) { return; }
 
     // 场景组合：默认不再强制注入风场/旗子，让"场景 / 旗子 / 无人机"各自独立，
     // 由关卡自行摆放。只有显式打开开关时才回退到“打开即自动填充”的便利行为。

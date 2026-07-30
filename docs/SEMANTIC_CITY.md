@@ -13,6 +13,10 @@
 
 水平接近不再依赖固定距离内切换固定速度。控制器根据剩余距离、实测水平速度、有效最大减速度和控制链响应延迟计算制动包络，再沿规划路线切线生成矢量速度，并使用实测速度反馈消除残余动量。偏航命令默认限制为每秒 `55°`；低于 `0.08 m/s` 时不发送新偏航目标。默认到点半径为 `0.25 m`，到点速度仍需不高于 `0.08 m/s`。
 
+这些参数统一存放在 `scripts/semantic_runtime_config.json`。每次任务会生成
+`run_manifest.json`，记录配置 SHA-256、请求风速、相机采集率及全部运行时
+脚本哈希，避免报告与实际代码版本脱节。
+
 ## 一键运行
 
 默认执行 A 起点到 B 配送区，途中必须绕过中央建筑并正常降落：
@@ -57,6 +61,63 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\outputs\run_semantic_regre
 ```
 
 可通过 `-PlanNames clear_hover_land,multi_goal_return` 只选择部分计划；默认遇到首个失败即停止，添加 `-ContinueOnFailure` 后会继续执行剩余计划。当前矩阵包含 6 个计划，覆盖直达悬停降落、巡检门到医疗站、绕障往返、多目标返航以及两类视觉任务。每次执行会在 `outputs/semantic-regression/<run-id>` 生成总表、JSON 结果和每个计划的独立日志，并汇总耗时、碰撞数、最终误差、到点速度及与上一轮的指标变化。
+
+报告还执行趋势门禁：碰撞、到点速度、最终误差超过配置阈值会返回
+`CHECK`；同风速且任务集合完全相同的上一轮存在时，平均误差或耗时恶化超过
+允许比例也会标记，避免拿单任务探针和完整矩阵做无效比较。
+
+## 非零风场语义矩阵
+
+城市地图默认保持无风。只有显式传入 `-WindMps` 时，GameMode 才会在
+无人机初始化前注入隐藏可视化的风场 actor；风扇阵列和箭头不会遮挡城市。
+若请求非零风但遥测平均风速低于请求值的 80%，任务强制返回 `CHECK`。
+
+默认运行配置中的稳定风速 `3 / 5 / 8 m/s`：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass `
+  -File .\scripts\run_semantic_wind_matrix.ps1 -ContinueOnFailure
+```
+
+`10 m/s` 保留为压力检查，不属于稳定演示基线。
+
+## 更换地图
+
+风场注入、控制器和回归门禁不绑定城市地图。新地图需要继续使用
+`ASZTUWindFieldGameMode` 与 `ASZTUDronePawn`，并提供同 schema 的语义地图
+JSON（包括 `ue_map`、`origin_world_m`、`goals` 和 `obstacles`）。之后只需：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass `
+  -File .\scripts\run_semantic_wind_matrix.ps1 `
+  -SemanticMapFile C:\maps\new_semantic_map.json `
+  -ContinueOnFailure
+```
+
+脚本默认从 JSON 的 `ue_map` 字段选择 UE 地图，也可用 `-UeMap` 显式覆盖。
+运行 manifest 会记录 UE 地图、语义 JSON 路径与 SHA-256。仪表盘同样接受
+`--map` 和可选 `--ue-map`，目标白名单会从 JSON 动态读取。视觉确认仍要求
+新地图提供当前检测器支持的地标外观；否则应先关闭视觉步骤或补充对应视觉资产。
+
+## 故障与离线回归
+
+```powershell
+python .\scripts\verify_semantic_resilience_test.py
+powershell -NoProfile -ExecutionPolicy Bypass `
+  -File .\scripts\verify_semantic_fault_injection.ps1
+```
+
+检查覆盖配置 schema、坏任务计划、碰撞/速度/耗时门禁和启动前端口状态，
+不需要启动 UE、PX4 或 QGC。
+
+## 相机预览
+
+默认采集率从统一配置读取，当前为 `2 Hz`；网页每 `400 ms` 发起条件请求，
+使用 ETag 避免重复传输同一帧。UE 端将命令行覆盖限制在最多 `4 Hz`，防止
+同步 GPU readback 干扰 HIL。该链路是低频任务观察画面，不宣称为驾驶级视频。
+视觉任务在等待点做位置保持时仍持续发送指向目标的航向设定，避免非零风下
+低速航向漂移令相机背向地标；到达等待点后若在 `vision-wait` 内仍未确认，
+任务会立即安全失败并降落，不再空等到整段任务超时。
 
 核心入口会自动识别两种目录：工作区的 `outputs/` 布局，以及 GitHub 仓库的 `scripts/ + scripts/test-plans/` 布局。仓库克隆后可以直接运行 `scripts/run_semantic_regression.ps1 -DryRun`；也可使用 `scripts/install_workspace_layout.ps1 -WorkspaceRoot <路径>` 映射成传统工作区结构。
 

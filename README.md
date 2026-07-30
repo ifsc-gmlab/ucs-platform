@@ -27,12 +27,32 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install_workspace_
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run_semantic_city.ps1 -DryRun
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run_semantic_regression.ps1 -DryRun
 python .\scripts\verify_dashboard_test.py
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify_semantic_fault_injection.ps1
 ```
 
 完整 UE `Content/` 及大型二进制资源不在本仓库中；它们需要从项目资产包恢复，其中部分场景资源可由 `UE/SourceArt` 和构建命令重新生成。不要把缓存、运行日志、截图、密钥或本机凭据提交到仓库。
+
+换地图时给任务或风场矩阵传入 `-SemanticMapFile`；脚本会从该 JSON 的
+`ue_map` 字段选择 UE 地图，也支持 `-UeMap` 覆盖。详见
+[`docs/SEMANTIC_CITY.md`](docs/SEMANTIC_CITY.md#更换地图)。
 
 ## 坐标约定
 
 UE、PX4、路线规划器、任务命令和原始遥测保持内部坐标不变。网页显示层单独使用 `显示 X = 内部 X`、`显示 Y = -内部 Y`、`显示偏航 = -内部偏航`，页面方向调整不会影响飞行控制逻辑。
 
 更详细的语义任务和验收方法见 `docs/SEMANTIC_CITY.md`。
+
+## 302 开启时安全推送
+
+仓库提供 `scripts/push_with_github_api_fallback.ps1`。它先尝试普通
+Git HTTPS 推送；若 Steamcommunity 302 导致连续 502，而
+`api.github.com` 仍可用，则通过 GitHub Git Database API 创建一份原子
+commit。更新 `main` 前会核对远端父提交、逐文件 blob SHA 和整棵 tree
+SHA，并始终使用 `force=false`：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass `
+  -File .\scripts\push_with_github_api_fallback.ps1
+```
+
+脚本要求工作树干净；远端发生变化或任一 SHA 不一致时会停止。

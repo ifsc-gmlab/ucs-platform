@@ -21,6 +21,7 @@ from semantic_motion_profile import (
     braking_limited_speed,
     profiled_velocity_command,
 )
+from semantic_runtime_config import controller_defaults, load_runtime_config
 from semantic_route_planner import intersected_obstacle_ids, plan_safe_route
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -39,6 +40,9 @@ class TelemetryReceiver:
         self.latest = None
         self.latest_monotonic = 0.0
         self.samples = 0
+        self.wind_samples = 0
+        self.wind_speed_sum = 0.0
+        self.max_wind_speed_mps = 0.0
         self.trace = open(trace_path, "w", encoding="utf-8") if trace_path else None
 
     def close(self):
@@ -61,6 +65,11 @@ class TelemetryReceiver:
                 continue
             newest = item
             self.samples += 1
+            wind_speed = float(item.get("wind_speed_mps", 0.0) or 0.0)
+            self.wind_samples += 1
+            self.wind_speed_sum += wind_speed
+            self.max_wind_speed_mps = max(
+                self.max_wind_speed_mps, wind_speed)
             self.latest_monotonic = time.monotonic()
         if newest is not None:
             self.latest = newest
@@ -151,19 +160,26 @@ def resolve_goal(map_data, requested):
         requested, ", ".join(sorted(map_data["goals"]))))
 
 
-def send_velocity_altitude_setpoint(sock, mav_cmd, sys_id, comp_id, vx, vy, altitude):
+def send_velocity_altitude_setpoint(
+        sock, mav_cmd, sys_id, comp_id, vx, vy, altitude,
+        heading_vx=None, heading_vy=None):
     send_velocity_position_z_setpoint(
-        sock, mav_cmd, sys_id, comp_id, vx, vy, -altitude)
+        sock, mav_cmd, sys_id, comp_id, vx, vy, -altitude,
+        heading_vx=heading_vx, heading_vy=heading_vy)
 
 
-def send_velocity_position_z_setpoint(sock, mav_cmd, sys_id, comp_id, vx, vy, z_setpoint):
+def send_velocity_position_z_setpoint(
+        sock, mav_cmd, sys_id, comp_id, vx, vy, z_setpoint,
+        heading_vx=None, heading_vy=None):
     # Ignore PX/PY, VZ, acceleration and yaw-rate. Follow the planned velocity
     # tangent through a slew limiter so route changes cannot snap the nose and
     # body-mounted range fans. At low speed PX4 retains the current heading.
     type_mask = 2531
     yaw = 0.0
+    yaw_vx = vx if heading_vx is None else heading_vx
+    yaw_vy = vy if heading_vy is None else heading_vy
     commanded_heading, heading_active = heading_limiter.update(
-        vx, vy, time.monotonic())
+        yaw_vx, yaw_vy, time.monotonic())
     if heading_active:
         yaw = commanded_heading
     else:
@@ -553,6 +569,18 @@ def navigate_to_goal(
                     vision_standoff[0], vision_standoff[1],
                     goal_x, goal_y), flush=True)
             nav_x, nav_y = vision_standoff
+            standoff_distance = math.hypot(nav_x - x, nav_y - y)
+            if standoff_distance <= args.arrival_radius:
+                if vision_wait_start is None:
+                    vision_wait_start = time.monotonic()
+                    print("[vision] standoff stable, holding target heading "
+                          "while waiting for %s marker..." % expected_label,
+                          flush=True)
+                elif time.monotonic() - vision_wait_start > args.vision_wait:
+                    raise RuntimeError(
+                        "vision could not confirm goal %s within %.1fs at "
+                        "standoff (last seen: %s)" % (
+                            expected_label, args.vision_wait, detected_labels))
 
         if (is_final_waypoint and require_vision and not vision_confirmed and
                 distance <= args.vision_radius):
@@ -646,7 +674,8 @@ def navigate_to_goal(
                             expected_label, args.vision_wait, detected_labels))
             if require_vision and not vision_confirmed:
                 send_velocity_altitude_setpoint(
-                    sock, mav_cmd, sys_id, comp_id, 0.0, 0.0, args.alt)
+                    sock, mav_cmd, sys_id, comp_id, 0.0, 0.0, args.alt,
+                    heading_vx=goal_x - x, heading_vy=goal_y - y)
                 flight.send_hb(sock, mav, hb)
                 time.sleep(0.02)
                 continue
@@ -734,8 +763,13 @@ def navigate_to_goal(
                     args.speed,
                     tracking_gain=args.velocity_tracking_gain)
 
+        vision_heading = (
+            require_vision and not vision_confirmed and
+            vision_standoff is not None)
         send_velocity_altitude_setpoint(
-            sock, mav_cmd, sys_id, comp_id, vx, vy, args.alt)
+            sock, mav_cmd, sys_id, comp_id, vx, vy, args.alt,
+            heading_vx=(goal_x - x) if vision_heading else None,
+            heading_vy=(goal_y - y) if vision_heading else None)
         flight.send_hb(sock, mav, hb)
         elapsed = time.monotonic() - started
         if elapsed - last_print >= 1.0:
@@ -754,33 +788,46 @@ def navigate_to_goal(
 
 
 def main():
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument("--config")
+    config_args, _ = config_parser.parse_known_args()
+    runtime_config = load_runtime_config(config_args.config)
+    defaults = controller_defaults(runtime_config)
+
     parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default=runtime_config["_path"],
+                        help="validated semantic runtime config JSON")
     parser.add_argument("--map", required=True, help="semantic map JSON")
     parser.add_argument("--goal", default="delivery_zone")
     parser.add_argument("--plan", help="JSON mission plan file")
     parser.add_argument("--instance", type=int, default=1)
     parser.add_argument("--telemetry-port", type=int, default=14660)
-    parser.add_argument("--alt", type=float, default=2.0)
-    parser.add_argument("--speed", type=float, default=1.25)
-    parser.add_argument("--avoid-speed", type=float, default=1.10)
-    parser.add_argument("--trigger-range", type=float, default=3.5)
-    parser.add_argument("--stop-range", type=float, default=1.2)
-    parser.add_argument("--arrival-radius", type=float, default=0.25)
-    parser.add_argument("--max-decel", type=float, default=0.12,
+    parser.add_argument("--alt", type=float, default=defaults["alt"])
+    parser.add_argument("--speed", type=float, default=defaults["speed"])
+    parser.add_argument("--avoid-speed", type=float, default=defaults["avoid_speed"])
+    parser.add_argument("--trigger-range", type=float, default=defaults["trigger_range"])
+    parser.add_argument("--stop-range", type=float, default=defaults["stop_range"])
+    parser.add_argument("--arrival-radius", type=float, default=defaults["arrival_radius"])
+    parser.add_argument("--max-decel", type=float, default=defaults["max_decel"],
                         help="horizontal braking envelope in m/s^2")
-    parser.add_argument("--control-latency", type=float, default=1.00,
+    parser.add_argument("--control-latency", type=float, default=defaults["control_latency"],
                         help="plant/control response reserve used by braking profile")
-    parser.add_argument("--velocity-tracking-gain", type=float, default=1.20,
+    parser.add_argument("--velocity-tracking-gain", type=float,
+                        default=defaults["velocity_tracking_gain"],
                         help="feedback gain for measured versus desired XY velocity")
-    parser.add_argument("--braking-stop-radius", type=float, default=0.10,
+    parser.add_argument("--braking-stop-radius", type=float,
+                        default=defaults["braking_stop_radius"],
                         help="distance reserved at zero speed by braking profile")
-    parser.add_argument("--yaw-rate-deg-s", type=float, default=55.0,
+    parser.add_argument("--yaw-rate-deg-s", type=float,
+                        default=defaults["yaw_rate_deg_s"],
                         help="maximum commanded heading change rate")
-    parser.add_argument("--yaw-min-speed", type=float, default=0.08,
+    parser.add_argument("--yaw-min-speed", type=float,
+                        default=defaults["yaw_min_speed"],
                         help="below this speed PX4 keeps the current heading")
-    parser.add_argument("--final-radius", type=float, default=0.50,
+    parser.add_argument("--final-radius", type=float, default=defaults["final_radius"],
                         help="maximum final horizontal landing error for PASS")
-    parser.add_argument("--mission-timeout", type=float, default=70.0)
+    parser.add_argument("--mission-timeout", type=float,
+                        default=defaults["mission_timeout"])
     parser.add_argument("--touchdown-speed", type=float, default=flight.DEFAULT_TOUCHDOWN_SPEED)
     parser.add_argument("--trace")
     parser.add_argument("--result")
@@ -861,6 +908,16 @@ def main():
         "vision_enabled": vision_enabled,
         "vision_confirmed": False,
         "vision_last_detections": [],
+        "runtime_config": {
+            "path": runtime_config["_path"],
+            "sha256": runtime_config["_sha256"],
+            "schema_version": runtime_config["schema_version"],
+        },
+        "wind": {
+            "mean_speed_mps": 0.0,
+            "max_speed_mps": 0.0,
+            "sample_count": 0,
+        },
         "motion_profile": {
             "max_decel_mps2": args.max_decel,
             "control_latency_s": args.control_latency,
@@ -988,6 +1045,12 @@ def main():
         result["sensor_samples"] = receiver.samples
         if result["collision_count"] is None and receiver.latest:
             result["collision_count"] = int(receiver.latest.get("obstacle_collision_count", 0))
+        result["wind"] = {
+            "mean_speed_mps": round(
+                receiver.wind_speed_sum / max(1, receiver.wind_samples), 4),
+            "max_speed_mps": round(receiver.max_wind_speed_mps, 4),
+            "sample_count": receiver.wind_samples,
+        }
         write_result(args.result, result)
         receiver.close()
 

@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "mission": {
+    "altitude_m": 2.0,
+    "cruise_speed_mps": 1.25,
+    "avoid_speed_mps": 1.1,
+    "trigger_range_m": 3.5,
+    "stop_range_m": 1.2,
+    "arrival_radius_m": 0.25,
+    "max_decel_mps2": 0.12,
+    "control_latency_s": 1.0,
+    "velocity_tracking_gain": 1.2,
+    "braking_stop_radius_m": 0.1,
+    "yaw_rate_deg_s": 55.0,
+    "yaw_min_speed_mps": 0.08,
+    "final_radius_m": 0.5,
+    "mission_timeout_s": 180
+  },
+  "regression_gates": {
+    "max_collisions": 0,
+    "max_arrival_speed_mps": 0.08,
+    "max_final_error_m": 0.5,
+    "max_average_error_regression_ratio": 0.5,
+    "max_average_duration_regression_ratio": 0.3
+  },
+  "wind_matrix": {
+    "stable_wind_speeds_mps": [3, 5, 8],
+    "stress_wind_speeds_mps": [10]
+  },
+  "camera": {
+    "capture_hz": 2.0,
+    "preview_poll_ms": 400,
+    "stale_after_s": 2.5
+  }
+}

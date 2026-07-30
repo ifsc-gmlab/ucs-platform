@@ -3,6 +3,9 @@
 param(
   [string]$Goal = "delivery_zone",
   [string]$PlanFile = "",
+  [string]$ConfigFile = "",
+  [string]$SemanticMapFile = "",
+  [string]$UeMap = "",
   [ValidateRange(1.0, 5.0)]
   [double]$Alt = 2.0,
   [ValidateRange(0.3, 3.0)]
@@ -13,6 +16,10 @@ param(
   [int]$EstimatorSettleSec = 35,
   [ValidateRange(30, 300)]
   [int]$UeStartupTimeoutSec = 180,
+  [ValidateRange(0.0, 15.0)]
+  [double]$WindMps = 0.0,
+  [ValidateRange(0.5, 10.0)]
+  [double]$CameraCaptureHz = 2.0,
   [string]$Distro = "Ubuntu",
   [switch]$OnboardCamera,
   [switch]$ShowSensorRays,
@@ -53,13 +60,34 @@ $VerifyScript = Join-Path $SourceDir "verify_px4_ue_hil.ps1"
 $ControllerScript = Join-Path $SourceDir "semantic_obstacle_mission.py"
 $VerdictRules = Join-Path $SourceDir "semantic_mission_verdict.py"
 $MotionProfile = Join-Path $SourceDir "semantic_motion_profile.py"
+$RuntimeConfigModule = Join-Path $SourceDir "semantic_runtime_config.py"
+$RuntimeConfig = if ($ConfigFile) {
+  [System.IO.Path]::GetFullPath($ConfigFile)
+}
+else {
+  Join-Path $SourceDir "semantic_runtime_config.json"
+}
 $RoutePlanner = Join-Path $SourceDir "semantic_route_planner.py"
 $TakeoffScript = Join-Path $SourceDir "takeoff_offboard.py"
 $LaunchScript = Join-Path $SourceDir "start_px4_ue_hil.sh"
 $RelayScript = Join-Path $SourceDir "mavlink_relay.py"
 $VisionDetector = Join-Path $SourceDir "vision_detector.py"
-$SemanticMap = Join-Path $SourceDir "urban_semantic_map.json"
-$UrbanMapAsset = "D:\SZTUWindFieldPX4Demo\Unreal\Content\Maps\SZTUUrbanSemanticScene.umap"
+$SemanticMap = if ($SemanticMapFile) {
+  [System.IO.Path]::GetFullPath($SemanticMapFile)
+}
+else {
+  Join-Path $SourceDir "urban_semantic_map.json"
+}
+$SemanticMapObject = Get-Content -LiteralPath $SemanticMap -Raw -Encoding UTF8 |
+  ConvertFrom-Json
+if (-not $UeMap) {
+  $UeMap = [string]$SemanticMapObject.ue_map
+}
+if ($UeMap -notmatch "^/Game/[A-Za-z0-9_./-]+$" -or $UeMap.Contains("..")) {
+  throw "invalid UE map asset path: $UeMap"
+}
+$UeMapRelativePath = $UeMap.Substring("/Game/".Length).Replace("/", "\")
+$UeMapAsset = Join-Path "D:\SZTUWindFieldPX4Demo\Unreal\Content" ($UeMapRelativePath + ".umap")
 $WslExe = Join-Path $env:WINDIR "System32\wsl.exe"
 if (-not (Test-Path -LiteralPath $WslExe)) { throw "WSL executable not found: $WslExe" }
 $PowerShellExe = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
@@ -108,17 +136,38 @@ function Sync-WslFile {
   }
 }
 
+Require-File $RuntimeConfig "semantic runtime config"
+$ConfigObject = Get-Content -LiteralPath $RuntimeConfig -Raw -Encoding UTF8 | ConvertFrom-Json
+if ($ConfigObject.schema_version -ne 1) {
+  throw "unsupported semantic runtime config schema: $($ConfigObject.schema_version)"
+}
+if (-not $PSBoundParameters.ContainsKey("Alt")) {
+  $Alt = [double]$ConfigObject.mission.altitude_m
+}
+if (-not $PSBoundParameters.ContainsKey("CruiseSpeed")) {
+  $CruiseSpeed = [double]$ConfigObject.mission.cruise_speed_mps
+}
+if (-not $PSBoundParameters.ContainsKey("MissionTimeoutSec")) {
+  $MissionTimeoutSec = [int]$ConfigObject.mission.mission_timeout_s
+}
+if (-not $PSBoundParameters.ContainsKey("CameraCaptureHz")) {
+  $CameraCaptureHz = [double]$ConfigObject.camera.capture_hz
+}
+$ConfigSha256 = (Get-FileHash -LiteralPath $RuntimeConfig -Algorithm SHA256).Hash.ToLowerInvariant()
+
 foreach ($required in @(
   @($VerifyScript, "HIL verifier"),
   @($ControllerScript, "semantic controller"),
   @($VerdictRules, "semantic mission verdict rules"),
   @($MotionProfile, "semantic motion profile"),
+  @($RuntimeConfigModule, "semantic runtime config module"),
+  @($RuntimeConfig, "semantic runtime config"),
   @($RoutePlanner, "semantic route planner"),
   @($TakeoffScript, "OFFBOARD helper"),
   @($LaunchScript, "PX4 launcher"),
   @($RelayScript, "MAVLink relay"),
   @($SemanticMap, "semantic map"),
-  @($UrbanMapAsset, "urban UE map")
+  @($UeMapAsset, "UE map")
 )) {
   Require-File $required[0] $required[1]
 }
@@ -141,6 +190,14 @@ $extraUEArgs = @()
 if ($OnboardCamera) { $extraUEArgs += "-OnboardCamera" }
 if ($ShowSensorRays) { $extraUEArgs += "-ShowSensorRays" }
 if ($Vision) { $extraUEArgs += "-VisionCapture" }
+if ($CameraCaptureHz -gt 0) {
+  $cameraHzText = $CameraCaptureHz.ToString([Globalization.CultureInfo]::InvariantCulture)
+  $extraUEArgs += "-VisionCaptureHz=$cameraHzText"
+}
+if ($WindMps -gt 0) {
+  $windText = $WindMps.ToString([Globalization.CultureInfo]::InvariantCulture)
+  $extraUEArgs += @("-SemanticWind", "-WindMps=$windText")
+}
 
 if ($DryRun) {
   if ($PlanFile) {
@@ -148,13 +205,15 @@ if ($DryRun) {
   } else {
     Write-Host "[semantic-city] dry run goal=$Goal alt=${Alt}m speed=${CruiseSpeed}m/s"
   }
-  Write-Host "[semantic-city] map=/Game/Maps/SZTUUrbanSemanticScene"
+  Write-Host "[semantic-city] map=$UeMap"
   Write-Host "[semantic-city] semantic map=$SemanticMap"
+  Write-Host "[semantic-city] config=$RuntimeConfig sha256=$ConfigSha256"
+  Write-Host "[semantic-city] wind=${WindMps}m/s camera=${CameraCaptureHz}Hz"
   if ($Vision) { Write-Host "[semantic-city] VISION mode: UE -VisionCapture + controller --vision" }
-  & $PythonExe -m py_compile $ControllerScript $VerdictRules $MotionProfile $RoutePlanner $TakeoffScript $VisionDetector
+  & $PythonExe -m py_compile $ControllerScript $VerdictRules $MotionProfile $RuntimeConfigModule $RoutePlanner $TakeoffScript $VisionDetector
   if ($LASTEXITCODE -ne 0) { throw "Python syntax validation failed" }
   & $VerifyScript `
-    -Map "/Game/Maps/SZTUUrbanSemanticScene" `
+    -Map $UeMap `
     -SkipFlight -SkipTelemetryListener -KeepRunning `
     -TelemetryHost "127.0.0.1" -TelemetryPort 14660 `
     -ExtraUEArgs $extraUEArgs -DryRun
@@ -167,9 +226,32 @@ if ($PlanFile) {
   $EffectivePlanFile = Join-Path $RunDir "mission_plan.json"
   Copy-Item -LiteralPath $PlanFile -Destination $EffectivePlanFile -Force
 }
-foreach ($runtimeFile in @($ControllerScript, $VerdictRules, $MotionProfile, $RoutePlanner, $TakeoffScript, $LaunchScript, $RelayScript, $VisionDetector)) {
+foreach ($runtimeFile in @($ControllerScript, $VerdictRules, $MotionProfile, $RuntimeConfigModule, $RuntimeConfig, $RoutePlanner, $TakeoffScript, $LaunchScript, $RelayScript, $VisionDetector)) {
   Sync-WslFile $runtimeFile
 }
+
+$RuntimeHashes = [ordered]@{}
+foreach ($runtimeFile in @($ControllerScript, $VerdictRules, $MotionProfile, $RuntimeConfigModule, $RuntimeConfig, $RoutePlanner, $TakeoffScript, $LaunchScript, $RelayScript, $VisionDetector)) {
+  $RuntimeHashes[(Split-Path -Leaf $runtimeFile)] = (
+    Get-FileHash -LiteralPath $runtimeFile -Algorithm SHA256
+  ).Hash.ToLowerInvariant()
+}
+$RunManifest = [ordered]@{
+  run_id = $RunStamp
+  created_at = (Get-Date).ToString("o")
+  config_path = $RuntimeConfig
+  config_sha256 = $ConfigSha256
+  ue_map = $UeMap
+  semantic_map_path = $SemanticMap
+  semantic_map_sha256 = (
+    Get-FileHash -LiteralPath $SemanticMap -Algorithm SHA256
+  ).Hash.ToLowerInvariant()
+  wind_mps = $WindMps
+  camera_capture_hz = $CameraCaptureHz
+  runtime_sha256 = $RuntimeHashes
+}
+$RunManifest | ConvertTo-Json -Depth 4 |
+  Set-Content -LiteralPath (Join-Path $RunDir "run_manifest.json") -Encoding UTF8
 
 # Restart WSL so the D: drive re-mounts cleanly. The 9p mount of the D:
 # drive goes stale in long-lived WSL sessions, which makes /mnt/d unreadable
@@ -218,7 +300,7 @@ try {
     try {
       Write-Host "[semantic-city] UE/PX4 startup attempt $startupAttempt/2"
       & $VerifyScript `
-        -Map "/Game/Maps/SZTUUrbanSemanticScene" `
+        -Map $UeMap `
         -Vehicle quad `
         -GraphicsRhi dx11 `
         -WindowWidth 1280 -WindowHeight 720 -NoSound `
@@ -260,6 +342,7 @@ try {
   $tracePath = Join-Path $RunDir "perception_trace.jsonl"
   $resultWsl = Get-WslPath $resultPath
   $traceWsl = Get-WslPath $tracePath
+  $configWsl = Get-WslPath $RuntimeConfig
   $culture = [System.Globalization.CultureInfo]::InvariantCulture
   $altText = $Alt.ToString($culture)
   $speedText = $CruiseSpeed.ToString($culture)
@@ -270,7 +353,7 @@ try {
     $planWsl = Get-WslPath $EffectivePlanFile
     $planArgs = " --plan '$planWsl'"
   }
-  $controllerCommand = "cd ~/szefitl && PYTHONUNBUFFERED=1 python3 -u semantic_obstacle_mission.py --map '$mapWsl' --goal '$Goal'$planArgs --alt $altText --speed $speedText --mission-timeout $MissionTimeoutSec --result '$resultWsl' --trace '$traceWsl'$visionArgs"
+  $controllerCommand = "cd ~/szefitl && PYTHONUNBUFFERED=1 python3 -u semantic_obstacle_mission.py --config '$configWsl' --map '$mapWsl' --goal '$Goal'$planArgs --alt $altText --speed $speedText --mission-timeout $MissionTimeoutSec --result '$resultWsl' --trace '$traceWsl'$visionArgs"
 
   Write-Host "[semantic-city] starting semantic obstacle-avoidance controller"
   $controllerStdout = Join-Path $RunDir "controller.stdout.log"
@@ -285,7 +368,10 @@ try {
   $controllerPreference = $ErrorActionPreference
   $ErrorActionPreference = "Continue"
   try {
-    & $WslExe -d $Distro -- bash -lc $controllerCommand 2>&1 |
+    # Keep WSL's Windows-proxy warning on stderr. Merging it into a nested
+    # PowerShell stdout pipeline can close the Linux child's pipe early and
+    # surface as Python BrokenPipeError during matrix runs.
+    & $WslExe -d $Distro -- bash -lc $controllerCommand 2> $controllerStderr |
       Tee-Object -FilePath $controllerStdout |
       Tee-Object -FilePath $controllerLog |
       Out-Host
@@ -314,6 +400,14 @@ try {
       -Pattern "Failsafe activated|RTL:" -Quiet)
   }
   $verdict = if ($result.pass -and $controllerExit -eq 0 -and -not $px4Failsafe) { "PASS" } else { "CHECK" }
+  if (
+    $WindMps -gt 0 -and
+    [double]$result.wind.mean_speed_mps -lt ($WindMps * 0.80)
+  ) {
+    $verdict = "CHECK"
+    $result.pass = $false
+    $result.failure = "requested wind was not observed in UE telemetry"
+  }
   $summary = @(
     "# Semantic City Mission Summary",
     "",
@@ -331,6 +425,9 @@ try {
     "- Avoidance demonstrated where required: $($result.avoidance_demonstrated)",
     "- Obstacle collisions: $($result.collision_count)",
     "- Sensor samples: $($result.sensor_samples)",
+    "- Requested wind: $WindMps m/s",
+    "- Mean / max measured wind: $($result.wind.mean_speed_mps) / $($result.wind.max_speed_mps) m/s",
+    "- Runtime config SHA-256: $ConfigSha256",
     "- Landed: $($result.landed)",
     "- Disarmed: $($result.disarmed)",
     "- Final position: $($result.final_position_m -join ', ')",
