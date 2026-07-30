@@ -91,10 +91,21 @@ $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
 $script:RepoRoot = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
+$script:SourceDir = Split-Path -Parent $PSCommandPath
+$script:ArtifactsDir = if ((Split-Path -Leaf $script:SourceDir) -ieq "scripts") {
+  Join-Path $script:RepoRoot "outputs"
+}
+else {
+  $script:SourceDir
+}
 $script:RunStamp = Get-Date -Format "yyyyMMdd-HHmmss"
-$script:RunDir = Join-Path $script:RepoRoot "outputs\verification-runs\$script:RunStamp"
+$script:RunDir = Join-Path $script:ArtifactsDir "verification-runs\$script:RunStamp"
+$script:UELogPath = Join-Path $script:RunDir "ue-startup.log"
 $script:Status = [ordered]@{
   UEStarted = $false
+  UEProcessAlive = $false
+  UELogActive = $false
+  UEMapLoaded = $false
   UEPortListening = $false
   PX4Started = $false
   PX4Connected = $false
@@ -195,6 +206,58 @@ function Wait-Until {
   return $false
 }
 
+function Get-UeStartupPhase {
+  if ($script:UEProc -and $script:UEProc.HasExited) {
+    return "process_exited"
+  }
+  if (Test-Port4560Listening) {
+    $script:Status.UEProcessAlive = $true
+    $script:Status.UEMapLoaded = $true
+    return "tcp_4560_ready"
+  }
+  if (-not (Test-Path -LiteralPath $script:UELogPath)) {
+    return "process_started"
+  }
+
+  $script:Status.UELogActive = $true
+  $tail = Get-Content -LiteralPath $script:UELogPath -Tail 500 -ErrorAction SilentlyContinue
+  $text = $tail -join "`n"
+  $mapLeaf = ($Map.Trim("/") -split "/")[-1]
+  if ($text -match "Bringing World .* up for play|LoadMap.*$([regex]::Escape($mapLeaf))|Game class is") {
+    $script:Status.UEMapLoaded = $true
+    return "map_loaded_waiting_for_4560"
+  }
+  if ($text -match "LogShaderCompilers|Missing cached shader map|Compiling.*shader|ShaderCompileWorker") {
+    return "shader_compiling"
+  }
+  return "log_active"
+}
+
+function Wait-UeReady {
+  param([int]$TimeoutSec)
+  Write-Step "waiting: staged UE readiness (timeout ${TimeoutSec}s)"
+  $deadline = (Get-Date).AddSeconds($TimeoutSec)
+  $lastPhase = ""
+  while ((Get-Date) -lt $deadline) {
+    $phase = Get-UeStartupPhase
+    if ($phase -ne $lastPhase) {
+      Write-Step "UE startup phase: $phase"
+      $lastPhase = $phase
+    }
+    if ($phase -eq "process_exited") {
+      throw "UnrealEditor exited before TCP 4560 became ready"
+    }
+    if ($phase -eq "tcp_4560_ready") {
+      $script:Status.UEPortListening = $true
+      Write-Step "ok: UE listening on TCP 4560"
+      return $true
+    }
+    Start-Sleep -Seconds 1
+  }
+  Write-Step "timeout: staged UE readiness (last phase: $lastPhase)"
+  return $false
+}
+
 function Stop-WslSim {
   Write-Step "stopping WSL px4/relay processes"
   $cmd = "pkill -TERM -f '[m]avlink_relay.py' 2>/dev/null || true; " +
@@ -229,6 +292,7 @@ function Copy-WslArtifacts {
 
 function Copy-UELog {
   if ($DryRun -or -not (Test-Path $script:RunDir)) { return }
+  if (Test-Path -LiteralPath $script:UELogPath) { return }
   $ueLogDir = Join-Path (Split-Path -Parent $Project) "Saved\Logs"
   if (-not (Test-Path $ueLogDir)) { return }
   $latest = Get-ChildItem -Path $ueLogDir -Filter "*.log" -File |
@@ -332,7 +396,7 @@ function Write-Summary {
     return
   }
 
-  $analyzer = Join-Path $script:RepoRoot "outputs\analyze_flight_run.py"
+  $analyzer = Join-Path $script:SourceDir "analyze_flight_run.py"
   if (Test-Path $analyzer) {
     Write-Step "running flight log analyzer"
     & $PythonExe $analyzer $script:RunDir `
@@ -342,7 +406,7 @@ function Write-Summary {
   }
 
   if ($FlightPattern -ne "legacy") {
-    $patternAnalyzer = Join-Path $script:RepoRoot "outputs\analyze_flight_patterns.py"
+    $patternAnalyzer = Join-Path $script:SourceDir "analyze_flight_patterns.py"
     if (Test-Path $patternAnalyzer) {
       Write-Step "running $FlightPattern pattern analyzer"
       & $PythonExe $patternAnalyzer $script:RunDir `
@@ -405,11 +469,13 @@ function Start-Validation {
     $ueArgs += $ExtraUEArgs
   }
   $ueArgs += "-Vehicle=$Vehicle"
+  $ueArgs += "-abslog=`"$script:UELogPath`""
   $script:UEProc = Start-Process -FilePath $UnrealEditor -ArgumentList $ueArgs -WindowStyle Normal -PassThru
   $script:Status.UEStarted = $true
+  $script:Status.UEProcessAlive = -not $script:UEProc.HasExited
   Write-Step "UnrealEditor pid: $($script:UEProc.Id)"
 
-  $script:Status.UEPortListening = Wait-Until "UE listening on TCP 4560" $TcpTimeoutSec { Test-Port4560Listening }
+  $script:Status.UEPortListening = Wait-UeReady $TcpTimeoutSec
   if (-not $script:Status.UEPortListening) { throw "UE did not listen on TCP 4560" }
 
   $culture = [System.Globalization.CultureInfo]::InvariantCulture
@@ -466,7 +532,7 @@ function Start-Validation {
       $computedTelemetrySeconds
     }
     $script:TelemetryProc = Start-Process -FilePath $PythonExe `
-      -ArgumentList @((Join-Path $script:RepoRoot "outputs\listen_telem_long.py"), "$telemetrySeconds") `
+      -ArgumentList @((Join-Path $script:SourceDir "listen_telem_long.py"), "$telemetrySeconds") `
       -RedirectStandardOutput (Join-Path $script:RunDir "telemetry.log") `
       -RedirectStandardError (Join-Path $script:RunDir "telemetry.err.log") `
       -WindowStyle Hidden `

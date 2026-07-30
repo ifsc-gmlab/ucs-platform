@@ -1698,6 +1698,14 @@ function mapDisplayYawDeg(yaw){
   return -(yaw||0);
 }
 
+function mapDisplaySensorBearingDeg(yaw,bodyAngle){
+  return mapDisplayYawDeg((yaw||0)+(bodyAngle||0));
+}
+
+function mapDisplayAngleToCanvasRad(displayAngle){
+  return -(displayAngle||0)*Math.PI/180;
+}
+
 function mapDisplayXY(x,y){
   const [localX,localY]=mapLocalXY(x,y);
   return mapLocalToDisplayXY(localX,localY);
@@ -1790,19 +1798,22 @@ function drawMap(t){
   if(t&&t.position_x_m!==undefined){
     let [localX,localY]=mapLocalXY(t.position_x_m,t.position_y_m);
     let [dx,dy]=w2s(localX,localY);
-    let yaw=(t.yaw_deg||0)*Math.PI/180;
-    ctx.save();ctx.translate(dx,dy);ctx.rotate(yaw);
+    let displayYaw=mapDisplayYawDeg(t.yaw_deg);
+    let canvasYaw=mapDisplayAngleToCanvasRad(displayYaw);
+    ctx.save();ctx.translate(dx,dy);ctx.rotate(canvasYaw);
     ctx.fillStyle='#1890ff';ctx.strokeStyle='#fff';ctx.lineWidth=2;
     ctx.beginPath();ctx.moveTo(12,0);ctx.lineTo(-8,-7);ctx.lineTo(-4,0);ctx.lineTo(-8,7);ctx.closePath();ctx.fill();ctx.stroke();
     ctx.restore();
     const ranges=[
-      {r:t.range_front_m||0,ang:0,color:'rgba(33,150,243,0.15)'},
-      {r:t.range_left_m||0,ang:-90,color:'rgba(33,150,243,0.1)'},
-      {r:t.range_right_m||0,ang:90,color:'rgba(33,150,243,0.1)'},
+      {r:t.range_front_m||0,bodyAngle:0,color:'rgba(33,150,243,0.15)'},
+      {r:t.range_left_m||0,bodyAngle:-90,color:'rgba(33,150,243,0.1)'},
+      {r:t.range_right_m||0,bodyAngle:90,color:'rgba(33,150,243,0.1)'},
     ];
     ranges.forEach(s=>{
       if(s.r>0&&s.r<15){
-        let rad=s.r*scale;let aRad=s.ang*Math.PI/180+yaw;
+        let rad=s.r*scale;
+        let displayBearing=mapDisplaySensorBearingDeg(t.yaw_deg,s.bodyAngle);
+        let aRad=mapDisplayAngleToCanvasRad(displayBearing);
         ctx.fillStyle=s.color;ctx.beginPath();ctx.moveTo(dx,dy);ctx.arc(dx,dy,rad,aRad-0.4,aRad+0.4);ctx.closePath();ctx.fill();
       }
     });

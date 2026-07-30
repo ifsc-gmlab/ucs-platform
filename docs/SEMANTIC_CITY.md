@@ -11,6 +11,8 @@
 
 控制器在水平飞行时会根据速度向量设置偏航角，使机头、机载相机和前向测距扇区与实际飞行方向一致；悬停时保持当前航向。语义区域在 UE 中使用无碰撞的空心地面标识，不再生成有厚度的实体色块。
 
+水平接近不再依赖固定距离内切换固定速度。控制器根据剩余距离、实测水平速度、有效最大减速度和控制链响应延迟计算制动包络，再沿规划路线切线生成矢量速度，并使用实测速度反馈消除残余动量。偏航命令默认限制为每秒 `55°`；低于 `0.08 m/s` 时不发送新偏航目标。默认到点半径为 `0.25 m`，到点速度仍需不高于 `0.08 m/s`。
+
 ## 一键运行
 
 默认执行 A 起点到 B 配送区，途中必须绕过中央建筑并正常降落：
@@ -54,7 +56,21 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\outputs\run_semantic_regre
 powershell -NoProfile -ExecutionPolicy Bypass -File .\outputs\run_semantic_regression.ps1 -DryRun
 ```
 
-可通过 `-PlanNames clear_hover_land,multi_goal_return` 只选择部分计划；默认遇到首个失败即停止，添加 `-ContinueOnFailure` 后会继续执行剩余计划。每次执行会在 `outputs/semantic-regression/<run-id>` 生成总表、JSON 结果和每个计划的独立日志。
+可通过 `-PlanNames clear_hover_land,multi_goal_return` 只选择部分计划；默认遇到首个失败即停止，添加 `-ContinueOnFailure` 后会继续执行剩余计划。当前矩阵包含 6 个计划，覆盖直达悬停降落、巡检门到医疗站、绕障往返、多目标返航以及两类视觉任务。每次执行会在 `outputs/semantic-regression/<run-id>` 生成总表、JSON 结果和每个计划的独立日志，并汇总耗时、碰撞数、最终误差、到点速度及与上一轮的指标变化。
+
+核心入口会自动识别两种目录：工作区的 `outputs/` 布局，以及 GitHub 仓库的 `scripts/ + scripts/test-plans/` 布局。仓库克隆后可以直接运行 `scripts/run_semantic_regression.ps1 -DryRun`；也可使用 `scripts/install_workspace_layout.ps1 -WorkspaceRoot <路径>` 映射成传统工作区结构。
+
+## UE 冷启动阶段
+
+验证器不再只等待固定秒数。启动日志会依次识别：
+
+1. `process_started`：UnrealEditor 进程已启动。
+2. `log_active`：UE 日志开始输出。
+3. `shader_compiling`：正在编译或加载着色器。
+4. `map_loaded_waiting_for_4560`：地图已进入运行态，等待 HIL 端口。
+5. `tcp_4560_ready`：TCP 4560 已监听，可以启动 PX4。
+
+若 UE 进程提前退出会立即失败；只有尚在推进的冷启动阶段才继续等待到总超时上限。
 
 ## 信息流
 

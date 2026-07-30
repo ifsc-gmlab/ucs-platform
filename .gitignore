@@ -8,7 +8,9 @@ venv/
 task_history.json
 current_task.json
 semantic-runs/
+semantic-regression/
 verification-runs/
+outputs/
 *.log
 
 # Unreal Engine generated directories

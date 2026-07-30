@@ -188,11 +188,26 @@ check("display transforms are centralized and display-only",
       "function mapLocalToDisplayXY(x,y)" in dd.DASHBOARD_HTML and
       "function mapDisplayVectorXY(x,y)" in dd.DASHBOARD_HTML and
       "function mapDisplayYawDeg(yaw)" in dd.DASHBOARD_HTML and
+      "function mapDisplaySensorBearingDeg(yaw,bodyAngle)" in dd.DASHBOARD_HTML and
+      "function mapDisplayAngleToCanvasRad(displayAngle)" in dd.DASHBOARD_HTML and
       "Never feed these values back to UE, PX4" in dd.DASHBOARD_HTML and
       "mapDisplayVectorXY(t.velocity_x_mps,t.velocity_y_mps)" in dd.DASHBOARD_HTML and
       "mapDisplayYawDeg(t.yaw_deg)" in dd.DASHBOARD_HTML)
 check("map preserves UE heading after display-coordinate conversion",
-      "ctx.rotate(yaw)" in dd.DASHBOARD_HTML)
+      "ctx.rotate(canvasYaw)" in dd.DASHBOARD_HTML and
+      "mapDisplayAngleToCanvasRad(displayYaw)" in dd.DASHBOARD_HTML)
+check("sensor fan angles use the same display transform",
+      "mapDisplaySensorBearingDeg(t.yaw_deg,s.bodyAngle)" in dd.DASHBOARD_HTML and
+      "mapDisplayAngleToCanvasRad(displayBearing)" in dd.DASHBOARD_HTML)
+
+with open(dd.DEFAULT_MAP, "r", encoding="utf-8") as anchor_handle:
+    anchor_map = __import__("json").load(anchor_handle)
+inspection = anchor_map["goals"]["inspection_gate"]["position_m"]
+medical = anchor_map["goals"]["medical_station"]["position_m"]
+check("inspection anchor converts to display (6,4)",
+      inspection == [6.0, -4.0] and [inspection[0], -inspection[1]] == [6.0, 4.0])
+check("medical anchor converts to display (18,-4)",
+      medical == [18.0, 4.0] and [medical[0], -medical[1]] == [18.0, -4.0])
 
 # A clear direct leg must not be failed merely because no artificial avoidance
 # maneuver occurred. Obstacle-crossing legs still require evidence.

@@ -16,11 +16,18 @@ import time
 
 import takeoff_offboard as flight
 from semantic_mission_verdict import evaluate_mission_result
+from semantic_motion_profile import (
+    HeadingSlewLimiter,
+    braking_limited_speed,
+    profiled_velocity_command,
+)
 from semantic_route_planner import intersected_obstacle_ids, plan_safe_route
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
+
+heading_limiter = HeadingSlewLimiter()
 
 
 class TelemetryReceiver:
@@ -150,15 +157,15 @@ def send_velocity_altitude_setpoint(sock, mav_cmd, sys_id, comp_id, vx, vy, alti
 
 
 def send_velocity_position_z_setpoint(sock, mav_cmd, sys_id, comp_id, vx, vy, z_setpoint):
-    # Ignore PX/PY, VZ, acceleration and yaw-rate. While translating, command
-    # yaw along the horizontal velocity vector so the nose, onboard camera and
-    # body-mounted range fans point in the actual direction of travel. When
-    # nearly stationary, ignore yaw instead of snapping back to zero.
-    horizontal_speed = math.hypot(vx, vy)
+    # Ignore PX/PY, VZ, acceleration and yaw-rate. Follow the planned velocity
+    # tangent through a slew limiter so route changes cannot snap the nose and
+    # body-mounted range fans. At low speed PX4 retains the current heading.
     type_mask = 2531
     yaw = 0.0
-    if horizontal_speed >= 0.08:
-        yaw = math.atan2(vy, vx)
+    commanded_heading, heading_active = heading_limiter.update(
+        vx, vy, time.monotonic())
+    if heading_active:
+        yaw = commanded_heading
     else:
         type_mask |= 1024  # POSITION_TARGET_TYPEMASK_YAW_IGNORE
     message = mav_cmd.set_position_target_local_ned_encode(
@@ -189,7 +196,9 @@ def local_position(sample, origin):
     )
 
 
-def horizontal_hold_velocity(receiver, origin, target_x, target_y, max_speed=0.45):
+def horizontal_hold_velocity(
+        receiver, origin, target_x, target_y, max_speed=0.45,
+        gain=0.72, damping=0.68):
     sample = receiver.latest or {}
     if not sample:
         return 0.0, 0.0, float("inf")
@@ -202,8 +211,6 @@ def horizontal_hold_velocity(receiver, origin, target_x, target_y, max_speed=0.4
     # Long legs can enter the final approach above 0.8 m/s; without enough
     # damping the vehicle crosses the target before the reversed command takes
     # effect and visibly oscillates for several seconds.
-    gain = 0.72
-    damping = 0.68
     vx = max(-max_speed, min(max_speed, error_x * gain - velocity_x * damping))
     vy = max(-max_speed, min(max_speed, error_y * gain - velocity_y * damping))
     return vx, vy, math.hypot(error_x, error_y)
@@ -287,7 +294,8 @@ def land_at(
     last_print = 0.0
     while time.monotonic() - settle_started < 20.0:
         vx, vy, error = horizontal_hold_velocity(
-            receiver, origin, x, y, max_speed=0.65)
+            receiver, origin, x, y,
+            max_speed=0.65, gain=1.20, damping=0.90)
         send_velocity_altitude_setpoint(
             sock, mav_cmd, sys_id, comp_id, vx, vy, altitude)
         flight.send_hb(sock, mav, hb)
@@ -433,7 +441,8 @@ def hover_at(
     started = time.monotonic()
     while time.monotonic() - started < seconds:
         vx, vy, _ = horizontal_hold_velocity(
-            receiver, origin, target_x, target_y, max_speed=0.35)
+            receiver, origin, target_x, target_y,
+            max_speed=0.50, gain=1.20, damping=0.90)
         send_velocity_altitude_setpoint(
             sock, mav_cmd, sys_id, comp_id, vx, vy, altitude)
         flight.send_hb(sock, mav, hb)
@@ -690,17 +699,40 @@ def navigate_to_goal(
             ndy = nav_y - y
             ndist = math.hypot(ndx, ndy)
             if require_vision and not vision_confirmed and vision_standoff is not None:
-                hold_speed = min(0.65, args.speed)
-                vx = max(-hold_speed, min(hold_speed, ndx * 0.65))
-                vy = max(-hold_speed, min(hold_speed, ndy * 0.65))
-            elif ndist < 4.0:
-                vx, vy, _ = horizontal_hold_velocity(
-                    receiver, origin, nav_x, nav_y,
-                    max_speed=min(0.55, args.speed))
+                speed_cap = braking_limited_speed(
+                    ndist,
+                    horizontal_speed,
+                    min(0.65, args.speed),
+                    args.max_decel,
+                    stop_radius_m=args.braking_stop_radius,
+                    response_time_s=args.control_latency)
+                vx, vy = profiled_velocity_command(
+                    ndx, ndy,
+                    float(sample.get("velocity_x_mps", 0.0)),
+                    float(sample.get("velocity_y_mps", 0.0)),
+                    speed_cap,
+                    min(0.65, args.speed),
+                    tracking_gain=args.velocity_tracking_gain)
             else:
-                scale = args.speed / max(ndist, 1e-6)
-                vx = ndx * scale
-                vy = ndy * scale
+                speed_cap = braking_limited_speed(
+                    ndist,
+                    horizontal_speed,
+                    args.speed,
+                    args.max_decel,
+                    stop_radius_m=args.braking_stop_radius,
+                    response_time_s=args.control_latency)
+                if not is_final_waypoint:
+                    # Keep a controlled rolling speed through planned corners;
+                    # the yaw limiter handles the turn without forcing a full
+                    # stop at every synthetic detour waypoint.
+                    speed_cap = max(min(0.45, args.speed), speed_cap)
+                vx, vy = profiled_velocity_command(
+                    ndx, ndy,
+                    float(sample.get("velocity_x_mps", 0.0)),
+                    float(sample.get("velocity_y_mps", 0.0)),
+                    speed_cap,
+                    args.speed,
+                    tracking_gain=args.velocity_tracking_gain)
 
         send_velocity_altitude_setpoint(
             sock, mav_cmd, sys_id, comp_id, vx, vy, args.alt)
@@ -733,7 +765,19 @@ def main():
     parser.add_argument("--avoid-speed", type=float, default=1.10)
     parser.add_argument("--trigger-range", type=float, default=3.5)
     parser.add_argument("--stop-range", type=float, default=1.2)
-    parser.add_argument("--arrival-radius", type=float, default=0.40)
+    parser.add_argument("--arrival-radius", type=float, default=0.25)
+    parser.add_argument("--max-decel", type=float, default=0.12,
+                        help="horizontal braking envelope in m/s^2")
+    parser.add_argument("--control-latency", type=float, default=1.00,
+                        help="plant/control response reserve used by braking profile")
+    parser.add_argument("--velocity-tracking-gain", type=float, default=1.20,
+                        help="feedback gain for measured versus desired XY velocity")
+    parser.add_argument("--braking-stop-radius", type=float, default=0.10,
+                        help="distance reserved at zero speed by braking profile")
+    parser.add_argument("--yaw-rate-deg-s", type=float, default=55.0,
+                        help="maximum commanded heading change rate")
+    parser.add_argument("--yaw-min-speed", type=float, default=0.08,
+                        help="below this speed PX4 keeps the current heading")
     parser.add_argument("--final-radius", type=float, default=0.50,
                         help="maximum final horizontal landing error for PASS")
     parser.add_argument("--mission-timeout", type=float, default=70.0)
@@ -817,6 +861,14 @@ def main():
         "vision_enabled": vision_enabled,
         "vision_confirmed": False,
         "vision_last_detections": [],
+        "motion_profile": {
+            "max_decel_mps2": args.max_decel,
+            "control_latency_s": args.control_latency,
+            "velocity_tracking_gain": args.velocity_tracking_gain,
+            "braking_stop_radius_m": args.braking_stop_radius,
+            "yaw_rate_deg_s": args.yaw_rate_deg_s,
+            "yaw_min_speed_mps": args.yaw_min_speed,
+        },
         "failure": None,
     }
     control = None
@@ -832,6 +884,12 @@ def main():
             float(initial.get("position_y_m", 0.0)),
             float(initial.get("position_z_m", 0.0)),
         )
+        heading_limiter.max_rate_rad_s = math.radians(
+            max(1.0, args.yaw_rate_deg_s))
+        heading_limiter.min_speed_mps = max(0.0, args.yaw_min_speed)
+        heading_limiter.reset(
+            math.radians(float(initial.get("yaw_deg", 0.0))),
+            time.monotonic())
         print("[sequence] accepted %d steps: %s" % (
             len(steps), json.dumps(steps, ensure_ascii=False)), flush=True)
         print("[*] UE telemetry origin=(%.3f, %.3f, %.3f)" % origin, flush=True)

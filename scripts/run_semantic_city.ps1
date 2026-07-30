@@ -42,15 +42,23 @@ try {
 catch { }
 
 $Root = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
-$VerifyScript = Join-Path $Root "outputs\verify_px4_ue_hil.ps1"
-$ControllerScript = Join-Path $Root "outputs\semantic_obstacle_mission.py"
-$VerdictRules = Join-Path $Root "outputs\semantic_mission_verdict.py"
-$RoutePlanner = Join-Path $Root "outputs\semantic_route_planner.py"
-$TakeoffScript = Join-Path $Root "outputs\takeoff_offboard.py"
-$LaunchScript = Join-Path $Root "outputs\start_px4_ue_hil.sh"
-$RelayScript = Join-Path $Root "outputs\mavlink_relay.py"
-$VisionDetector = Join-Path $Root "outputs\vision_detector.py"
-$SemanticMap = Join-Path $Root "outputs\urban_semantic_map.json"
+$SourceDir = Split-Path -Parent $PSCommandPath
+$ArtifactsDir = if ((Split-Path -Leaf $SourceDir) -ieq "scripts") {
+  Join-Path $Root "outputs"
+}
+else {
+  $SourceDir
+}
+$VerifyScript = Join-Path $SourceDir "verify_px4_ue_hil.ps1"
+$ControllerScript = Join-Path $SourceDir "semantic_obstacle_mission.py"
+$VerdictRules = Join-Path $SourceDir "semantic_mission_verdict.py"
+$MotionProfile = Join-Path $SourceDir "semantic_motion_profile.py"
+$RoutePlanner = Join-Path $SourceDir "semantic_route_planner.py"
+$TakeoffScript = Join-Path $SourceDir "takeoff_offboard.py"
+$LaunchScript = Join-Path $SourceDir "start_px4_ue_hil.sh"
+$RelayScript = Join-Path $SourceDir "mavlink_relay.py"
+$VisionDetector = Join-Path $SourceDir "vision_detector.py"
+$SemanticMap = Join-Path $SourceDir "urban_semantic_map.json"
 $UrbanMapAsset = "D:\SZTUWindFieldPX4Demo\Unreal\Content\Maps\SZTUUrbanSemanticScene.umap"
 $WslExe = Join-Path $env:WINDIR "System32\wsl.exe"
 if (-not (Test-Path -LiteralPath $WslExe)) { throw "WSL executable not found: $WslExe" }
@@ -63,7 +71,7 @@ if (-not (Test-Path -LiteralPath $PythonExe)) {
   $PythonExe = $PythonCommand.Source
 }
 $RunStamp = Get-Date -Format "yyyyMMdd-HHmmss"
-$RunDir = Join-Path $Root "outputs\semantic-runs\$RunStamp"
+$RunDir = Join-Path $ArtifactsDir "semantic-runs\$RunStamp"
 
 function Require-File {
   param([string]$Path, [string]$Name)
@@ -104,6 +112,7 @@ foreach ($required in @(
   @($VerifyScript, "HIL verifier"),
   @($ControllerScript, "semantic controller"),
   @($VerdictRules, "semantic mission verdict rules"),
+  @($MotionProfile, "semantic motion profile"),
   @($RoutePlanner, "semantic route planner"),
   @($TakeoffScript, "OFFBOARD helper"),
   @($LaunchScript, "PX4 launcher"),
@@ -142,7 +151,7 @@ if ($DryRun) {
   Write-Host "[semantic-city] map=/Game/Maps/SZTUUrbanSemanticScene"
   Write-Host "[semantic-city] semantic map=$SemanticMap"
   if ($Vision) { Write-Host "[semantic-city] VISION mode: UE -VisionCapture + controller --vision" }
-  & $PythonExe -m py_compile $ControllerScript $RoutePlanner $TakeoffScript $VisionDetector
+  & $PythonExe -m py_compile $ControllerScript $VerdictRules $MotionProfile $RoutePlanner $TakeoffScript $VisionDetector
   if ($LASTEXITCODE -ne 0) { throw "Python syntax validation failed" }
   & $VerifyScript `
     -Map "/Game/Maps/SZTUUrbanSemanticScene" `
@@ -158,7 +167,7 @@ if ($PlanFile) {
   $EffectivePlanFile = Join-Path $RunDir "mission_plan.json"
   Copy-Item -LiteralPath $PlanFile -Destination $EffectivePlanFile -Force
 }
-foreach ($runtimeFile in @($ControllerScript, $VerdictRules, $RoutePlanner, $TakeoffScript, $LaunchScript, $RelayScript, $VisionDetector)) {
+foreach ($runtimeFile in @($ControllerScript, $VerdictRules, $MotionProfile, $RoutePlanner, $TakeoffScript, $LaunchScript, $RelayScript, $VisionDetector)) {
   Sync-WslFile $runtimeFile
 }
 
@@ -231,7 +240,7 @@ try {
         $ErrorActionPreference = "Continue"
         try {
           & $PowerShellExe -NoProfile -ExecutionPolicy Bypass `
-            -File (Join-Path $Root "outputs\px4_emergency_stop.ps1") -KillSim |
+            -File (Join-Path $SourceDir "px4_emergency_stop.ps1") -KillSim |
             Out-Host
         }
         finally {
@@ -344,7 +353,7 @@ finally {
     $oldPreference = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-      & $PowerShellExe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Root "outputs\px4_emergency_stop.ps1") -KillSim | Out-Host
+      & $PowerShellExe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $SourceDir "px4_emergency_stop.ps1") -KillSim | Out-Host
       Get-Process UnrealEditor -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
     }
     finally {

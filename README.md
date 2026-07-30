@@ -6,20 +6,27 @@
 
 - `UE/`：Unreal 项目描述文件、配置、C++ 源码、构建脚本和可再生成的源素材。
 - `scripts/`：PX4/UE HIL 启动、诊断、飞行测试、网页控制台和语义任务脚本。
-- `test-plans/`：语义任务的 JSON 计划。
+- `scripts/test-plans/`：语义任务的 JSON 计划。
 - `docs/`：部署、数据流、飞行模式、PID、语义场景和复现实验说明。
 
 ## 恢复到本地工作区
 
 1. 准备 UE 5.8、WSL/PX4 SITL、QGroundControl 和 Python 环境。
 2. 将 `UE/` 中的内容合并到本地 Unreal 项目目录。
-3. 在实验工作区建立 `outputs/`，将 `scripts/` 和 `test-plans/` 的内容分别放入 `outputs/` 与 `outputs/test-plans/`。
-4. 按 `docs/DEPLOYMENT_MANUAL.md` 配置本机路径和依赖，再先运行 DryRun：
+3. 可以直接从仓库运行核心入口；脚本会自动识别 `scripts/` 布局并把运行产物写入根目录 `outputs/`。
+4. 如果需要传统工作区布局，可运行映射脚本：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\outputs\run_semantic_city.ps1 -DryRun
-powershell -NoProfile -ExecutionPolicy Bypass -File .\outputs\run_semantic_regression.ps1 -DryRun
-python .\outputs\verify_dashboard_test.py
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install_workspace_layout.ps1 `
+  -WorkspaceRoot "D:\your-workspace"
+```
+
+5. 按 `docs/DEPLOYMENT_MANUAL.md` 配置本机路径和依赖，再先运行 DryRun：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run_semantic_city.ps1 -DryRun
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run_semantic_regression.ps1 -DryRun
+python .\scripts\verify_dashboard_test.py
 ```
 
 完整 UE `Content/` 及大型二进制资源不在本仓库中；它们需要从项目资产包恢复，其中部分场景资源可由 `UE/SourceArt` 和构建命令重新生成。不要把缓存、运行日志、截图、密钥或本机凭据提交到仓库。
