@@ -24,6 +24,14 @@ public class SZTUWindFieldPX4Demo : ModuleRules
             "RenderCore"
         });
 
+        // The map-building commandlet imports the supplied IFSC PNG into a
+        // texture asset. Keep the editor-only factory dependency out of game
+        // builds while linking it into the Editor target used by the commandlet.
+        if (Target.bBuildEditor)
+        {
+            PrivateDependencyModuleNames.Add("UnrealEd");
+        }
+
         // MAVLink C 头文件（从 PX4 build 拷贝，用于 SITL 仿真器接口）
         string MavlinkDir = Path.GetFullPath(Path.Combine(ModuleDirectory, "..", "ThirdParty", "MAVLink"));
         PublicIncludePaths.Add(MavlinkDir);

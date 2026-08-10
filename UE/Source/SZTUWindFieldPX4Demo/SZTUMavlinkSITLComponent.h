@@ -1,7 +1,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "Components/ActorComponent.h"
+#include "SZTUFlightControllerComponent.h"
 #include "SZTUMavlinkSITLComponent.generated.h"
 
 // MAVLink SITL 仿真器接口组件
@@ -9,7 +9,7 @@
 // 发送：HIL_SENSOR / HIL_GPS / HIL_STATE_QUATERNION / ODOMETRY（传感器+状态）
 // 接收：HIL_ACTUATOR_CONTROLS（电机输出）
 UCLASS(ClassGroup = (SZTU), meta = (BlueprintSpawnableComponent))
-class SZTUWINDFIELDPX4DEMO_API USZTUMavlinkSITLComponent : public UActorComponent
+class SZTUWINDFIELDPX4DEMO_API USZTUMavlinkSITLComponent : public USZTUFlightControllerComponent
 {
     GENERATED_BODY()
 
@@ -22,29 +22,34 @@ public:
 
     // 是否已连接 PX4 SITL
     UFUNCTION(BlueprintCallable, Category = "SITL")
-    bool IsConnected() const { return ClientSocket != nullptr; }
+    virtual bool IsConnected() const override { return ClientSocket != nullptr; }
 
     // 获取最新电机输出（标准化推力 0~1，按电机索引）
     UFUNCTION(BlueprintCallable, Category = "SITL")
-    void GetMotorThrusts(TArray<float>& OutThrusts) const;
+    virtual void GetMotorThrusts(TArray<float>& OutThrusts) const override;
 
     // Raw HIL actuator values. Multirotor motors normally use [0,1], while
     // reversible rover motors and steering servos use [-1,1].
     UFUNCTION(BlueprintCallable, Category = "SITL")
-    void GetActuatorControls(TArray<float>& OutControls) const;
+    virtual void GetActuatorControls(TArray<float>& OutControls) const override;
 
     UFUNCTION(BlueprintCallable, Category = "SITL")
-    void SetActuatorCount(int32 Count);
+    virtual void SetActuatorCount(int32 Count) override;
 
     // 重新初始化 TCP server socket（用当前 ListenPort）。
     // 用途：Owner Pawn 在 BeginPlay 改了 ListenPort 之后调一次让 socket 重新 bind。
     UFUNCTION(BlueprintCallable, Category = "SITL")
     void ReinitServerSocket();
 
+    virtual void SetTransportPort(int32 Port) override { ListenPort = Port; }
+    virtual int32 GetTransportPort() const override { return ListenPort; }
+    virtual void ReinitializeTransport() override { ReinitServerSocket(); }
+    virtual FName GetBackendName() const override { return TEXT("PX4-MAVLink"); }
+
     // 发送无人机状态给 PX4（位置/速度/姿态/角速度，单位：米、米/秒、弧度）
-    void SendDroneState(const FVector& PositionM, const FVector& VelocityMps,
-                        const FQuat& Attitude, const FVector& BodyAngularVelocityRadS,
-                        const FVector& BodyLinearAccelMps2);
+    virtual void SendDroneState(const FVector& PositionM, const FVector& VelocityMps,
+                                const FQuat& Attitude, const FVector& BodyAngularVelocityRadS,
+                                const FVector& BodyLinearAccelMps2) override;
 
     virtual void TickComponent(float DeltaTime, ELevelTick TickType,
                                FActorComponentTickFunction* ThisTickFunction) override;

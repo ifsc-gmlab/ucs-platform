@@ -6,6 +6,11 @@ param(
   [int]$SessionSeconds = 900,
   [string]$Distro = "Ubuntu",
   [string]$QgcPath = "C:\IFSC-Station\IFSC-Station.exe",
+  [string]$UnrealEditor = "D:\Epic Games\UE_5.8\Engine\Binaries\Win64\UnrealEditor.exe",
+  [string]$Project = "D:\SZTUWindFieldPX4Demo\Unreal\SZTUWindFieldPX4Demo.uproject",
+  [string]$PythonExe = "python",
+  [ValidateRange(0, 1000)]
+  [int]$MaxFps = 0,
   [ValidateRange(0, 120)]
   [int]$EstimatorSettleSec = 35,
   [ValidateRange(0.1, 5.0)]
@@ -92,6 +97,9 @@ Write-Host "[qgc-control] estimator settle=${EstimatorSettleSec}s ABL_LIM=$Ekf2A
 Write-Host "[qgc-control] wind UI=$WindUI"
 
 $verifyParams = @{
+  UnrealEditor = $UnrealEditor
+  Project = $Project
+  PythonExe = $PythonExe
   Map = $Map
   Vehicle = $Vehicle
   WslLaunchScript = "~/szefitl/start_px4_ue_qgc_control.sh"
@@ -99,6 +107,7 @@ $verifyParams = @{
   WindowWidth = 960
   WindowHeight = 540
   NoSound = $true
+  MaxFps = $MaxFps
   SkipFlight = $true
   KeepRunning = $true
   TelemetryDurationSec = $SessionSeconds

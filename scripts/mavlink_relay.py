@@ -19,6 +19,13 @@ LISTEN_PORT = int(os.environ.get("QGC_RELAY_PORT", "14550"))
 PX4_ADDR = ("127.0.0.1", int(os.environ.get("PX4_GCS_PORT", "18570")))
 WIN_IP = os.environ.get("QGC_WIN_IP", "172.19.208.1")
 WIN_ADDR = (WIN_IP, int(os.environ.get("QGC_WIN_PORT", os.environ.get("QGC_RELAY_PORT", "14550"))))
+# Keep the autonomous controller on a separate local port.  PX4's MAV_0
+# stream targets the relay port, so duplicate PX4 telemetry instead of making
+# QGC and the controller share (and race on) UDP 14550.
+CONTROLLER_ADDR = (
+    "127.0.0.1",
+    int(os.environ.get("CONTROLLER_RELAY_PORT", "51917")),
+)
 
 COMMAND_NAMES = {
     22: "MAV_CMD_NAV_TAKEOFF",
@@ -97,7 +104,10 @@ def main():
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(("0.0.0.0", LISTEN_PORT))
     print(f"[relay] listening on 0.0.0.0:{LISTEN_PORT}", flush=True)
-    print(f"[relay] QGC {WIN_ADDR} <-> PX4 {PX4_ADDR}", flush=True)
+    print(
+        f"[relay] PX4 {PX4_ADDR} -> QGC {WIN_ADDR} + controller {CONTROLLER_ADDR}",
+        flush=True,
+    )
 
     px4_packets = 0
     qgc_packets = 0
@@ -107,6 +117,7 @@ def main():
         if not from_qgc:
             px4_packets += 1
             sock.sendto(data, WIN_ADDR)
+            sock.sendto(data, CONTROLLER_ADDR)
         else:
             qgc_packets += 1
             sock.sendto(data, PX4_ADDR)

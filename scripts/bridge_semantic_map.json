@@ -1,0 +1,48 @@
+{
+  "map_id": "sztu_arch_bridge_semantic_v2",
+  "brand": "IFSC",
+  "display_name": "IFSC 30米拱桥智能巡检",
+  "ue_map": "/Game/Maps/SZTUBridgeSemanticScene",
+  "frame": "PX4_LOCAL_NED",
+  "origin_world_m": [2.5, 0.0, 0.0],
+  "default_goal": "far_pad",
+  "goals": {
+    "start_pad": {"label": "Bridge Start Pad", "display_label": "\u8fd1\u5cb8\u8d77\u98de\u70b9", "position_m": [0.0, 0.0], "altitude_m": 3.0, "aliases": ["start", "home"]},
+    "bridge_entry": {"label": "Bridge Entry", "display_label": "\u62f1\u6865\u5165\u53e3", "position_m": [3.0, 0.0], "altitude_m": 3.2, "aliases": ["entry"]},
+    "bridge_ascent": {"label": "Bridge Ascent", "display_label": "\u62f1\u6865\u4e0a\u5347\u6bb5", "position_m": [9.0, 0.0], "altitude_m": 4.2, "aliases": ["ascent"]},
+    "bridge_apex": {"label": "Bridge Highest Point", "display_label": "\u62f1\u6865\u6700\u9ad8\u70b9", "position_m": [15.0, 0.0], "altitude_m": 5.0, "aliases": ["apex", "highest"]},
+    "bridge_descent": {"label": "Bridge Descent", "display_label": "\u62f1\u6865\u4e0b\u964d\u6bb5", "position_m": [21.0, 0.0], "altitude_m": 4.2, "aliases": ["descent"]},
+    "bridge_exit": {"label": "Bridge Exit", "display_label": "\u62f1\u6865\u51fa\u53e3", "position_m": [27.0, 0.0], "altitude_m": 3.2, "aliases": ["exit"]},
+    "far_pad": {"label": "Far Landing Pad", "display_label": "\u5bf9\u5cb8\u964d\u843d\u70b9", "position_m": [30.0, 0.0], "altitude_m": 3.0, "aliases": ["far", "finish", "landing"]}
+  },
+  "default_plan": [
+    {"action": "fly_to", "goal_id": "bridge_entry", "vision": false},
+    {"action": "fly_to", "goal_id": "bridge_ascent", "vision": false},
+    {"action": "fly_to", "goal_id": "bridge_apex", "vision": false},
+    {"action": "fly_to", "goal_id": "bridge_descent", "vision": false},
+    {"action": "fly_to", "goal_id": "bridge_exit", "vision": false},
+    {"action": "fly_to", "goal_id": "far_pad", "vision": false},
+    {"action": "land"}
+  ],
+  "obstacles": [],
+  "inspection_zones": [
+    {"class": "road_crack", "label": "\u8def\u9762\u88c2\u7f1d", "position_m": [9.0, -0.9], "radius_m": 0.55, "render": "surface_mark"},
+    {"class": "road_crack", "label": "\u8def\u9762\u88c2\u7f1d", "position_m": [14.8, 0.8], "radius_m": 0.55, "render": "surface_mark"},
+    {"class": "road_crack", "label": "\u8def\u9762\u88c2\u7f1d", "position_m": [21.0, -0.7], "radius_m": 0.55, "render": "surface_mark"},
+    {"class": "plant", "label": "\u690d\u7269\u89c2\u6d4b\u533a", "position_m": [8.6, -1.6], "radius_m": 1.2, "render": "semantic_only"},
+    {"class": "pest", "label": "\u866b\u5bb3\u89c2\u6d4b\u533a", "position_m": [14.9, 1.4], "radius_m": 0.8, "render": "semantic_only"},
+    {"class": "bird", "label": "\u9e1f\u5bb3\u89c2\u6d4b\u533a", "position_m": [20.8, -1.5], "radius_m": 1.4, "render": "semantic_only"},
+    {"class": "plant", "label": "\u690d\u7269\u89c2\u6d4b\u533a", "position_m": [24.5, 2.2], "radius_m": 1.2, "render": "semantic_only"}
+  ],
+  "inspection_classes": ["road_crack", "pest", "plant", "bird"],
+  "bridge": {"deck_start_m": 0.0, "deck_end_m": 30.0, "deck_length_m": 30.0, "deck_width_m": 8.0, "structural_span_m": 24.0, "deck_rise_m": 1.6},
+  "dashboard": {
+    "title": "IFSC 30\u7c73\u62f1\u6865\u667a\u80fd\u5de1\u68c0\u63a7\u5236\u53f0",
+    "mission_timeout_s": 120,
+    "estimator_settle_s": 35,
+    "archive_frames": true,
+    "camera_capture_hz": 1.0,
+    "camera_width": 320,
+    "camera_height": 180
+  }
+}

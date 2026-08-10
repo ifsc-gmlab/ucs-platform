@@ -5,7 +5,7 @@
 #include "SZTURoverPawn.generated.h"
 
 class UStaticMeshComponent;
-class USZTUMavlinkSITLComponent;
+class USZTUFlightControllerComponent;
 
 UCLASS(Blueprintable)
 class SZTUWINDFIELDPX4DEMO_API ASZTURoverPawn : public APawn
@@ -23,7 +23,7 @@ public:
     UStaticMeshComponent* Body = nullptr;
 
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components")
-    USZTUMavlinkSITLComponent* SITLComponent = nullptr;
+    USZTUFlightControllerComponent* SITLComponent = nullptr;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Rover Physics")
     float WheelbaseM = 0.6f;

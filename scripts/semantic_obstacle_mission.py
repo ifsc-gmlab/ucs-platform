@@ -426,10 +426,14 @@ def load_mission_steps(args, map_data):
             raise ValueError("mission step %d appears after land" % (index + 1))
         if action == "fly_to":
             goal_id, _ = resolve_goal(map_data, str(raw.get("goal_id", "")))
+            fly_through = bool(raw.get("fly_through", False))
+            if fly_through and bool(raw.get("vision", False)):
+                raise ValueError("fly_through steps cannot require vision confirmation")
             steps.append({
                 "action": "fly_to",
                 "goal_id": goal_id,
                 "vision": bool(raw.get("vision", False)),
+                "fly_through": fly_through,
             })
         elif action == "hover":
             seconds = float(raw.get("seconds", 3.0))
@@ -468,8 +472,12 @@ def hover_at(
 
 def navigate_to_goal(
         sock, mav, mav_cmd, sys_id, comp_id, hb, receiver, origin,
-        args, map_data, goal_id, goal, require_vision, vision_scanner, result):
+        args, map_data, goal_id, goal, require_vision, fly_through,
+        vision_scanner, result):
     goal_x, goal_y = [float(value) for value in goal["position_m"]]
+    target_alt = float(goal.get("altitude_m", args.alt))
+    if not 0.5 <= target_alt <= 20.0:
+        raise ValueError("goal %s altitude_m must be between 0.5 and 20.0" % goal_id)
     expected_label = goal_id
     vision_wait_start = None
     last_vision_request = 0.0
@@ -511,9 +519,9 @@ def navigate_to_goal(
         direct_path_obstacles,
         json.dumps(route["points"], ensure_ascii=False)), flush=True)
 
-    print("[sequence] fly_to %s (%s) local=(%.2f, %.2f) vision=%s" % (
+    print("[sequence] fly_to %s (%s) local=(%.2f, %.2f) vision=%s fly_through=%s" % (
         goal_id, goal.get("label", goal_id), goal_x, goal_y,
-        require_vision), flush=True)
+        require_vision, fly_through), flush=True)
     started = time.monotonic()
     last_print = 0.0
     avoid_until_x = None
@@ -527,7 +535,7 @@ def navigate_to_goal(
             if stale_since is None:
                 stale_since = time.monotonic()
             send_velocity_altitude_setpoint(
-                sock, mav_cmd, sys_id, comp_id, 0.0, 0.0, args.alt)
+                sock, mav_cmd, sys_id, comp_id, 0.0, 0.0, target_alt)
             flight.send_hb(sock, mav, hb)
             if time.monotonic() - stale_since > 3.0:
                 raise RuntimeError("UE perception telemetry stale for more than 3s")
@@ -620,6 +628,36 @@ def navigate_to_goal(
                                   expected_label, seen, recent_count,
                                   snapshot["duration_sec"]), flush=True)
 
+        if (is_final_waypoint and fly_through and
+                distance <= args.fly_through_radius):
+            print("[sequence] passed through %s at local=(%.2f, %.2f) "
+                  "error=%.3fm speed=%.3fm/s" % (
+                      goal_id, x, y, distance, horizontal_speed), flush=True)
+            leg_avoidance_events = result["avoidance_events"] - leg_avoidance_start
+            avoidance_required = bool(direct_path_obstacles)
+            return {
+                "action": "fly_to",
+                "goal_id": goal_id,
+                "goal_label": goal.get("label", goal_id),
+                "goal_position_m": [goal_x, goal_y],
+                "reached": True,
+                "fly_through": True,
+                "arrival_error_m": round(distance, 4),
+                "arrival_speed_mps": round(horizontal_speed, 4),
+                "vision_required": False,
+                "vision_confirmed": False,
+                "vision_frames": 0,
+                "route_points_m": route["points"],
+                "route_distance_m": route["distance_m"],
+                "planned_detour_waypoints": leg_detours,
+                "avoidance_events": leg_avoidance_events,
+                "direct_path_obstacles": direct_path_obstacles,
+                "avoidance_required": avoidance_required,
+                "avoidance_demonstrated": (
+                    not avoidance_required or leg_detours >= 1 or
+                    leg_avoidance_events >= 1),
+            }
+
         if is_final_waypoint and distance <= args.arrival_radius:
             if not require_vision or vision_confirmed:
                 # Do not hand a still-drifting vehicle to the next plan step.
@@ -674,7 +712,7 @@ def navigate_to_goal(
                             expected_label, args.vision_wait, detected_labels))
             if require_vision and not vision_confirmed:
                 send_velocity_altitude_setpoint(
-                    sock, mav_cmd, sys_id, comp_id, 0.0, 0.0, args.alt,
+                    sock, mav_cmd, sys_id, comp_id, 0.0, 0.0, target_alt,
                     heading_vx=goal_x - x, heading_vy=goal_y - y)
                 flight.send_hb(sock, mav, hb)
                 time.sleep(0.02)
@@ -750,11 +788,11 @@ def navigate_to_goal(
                     args.max_decel,
                     stop_radius_m=args.braking_stop_radius,
                     response_time_s=args.control_latency)
-                if not is_final_waypoint:
+                if not is_final_waypoint or fly_through:
                     # Keep a controlled rolling speed through planned corners;
                     # the yaw limiter handles the turn without forcing a full
                     # stop at every synthetic detour waypoint.
-                    speed_cap = max(min(0.45, args.speed), speed_cap)
+                    speed_cap = max(min(0.55, args.speed), speed_cap)
                 vx, vy = profiled_velocity_command(
                     ndx, ndy,
                     float(sample.get("velocity_x_mps", 0.0)),
@@ -767,7 +805,7 @@ def navigate_to_goal(
             require_vision and not vision_confirmed and
             vision_standoff is not None)
         send_velocity_altitude_setpoint(
-            sock, mav_cmd, sys_id, comp_id, vx, vy, args.alt,
+            sock, mav_cmd, sys_id, comp_id, vx, vy, target_alt,
             heading_vx=(goal_x - x) if vision_heading else None,
             heading_vy=(goal_y - y) if vision_heading else None)
         flight.send_hb(sock, mav, hb)
@@ -808,6 +846,8 @@ def main():
     parser.add_argument("--trigger-range", type=float, default=defaults["trigger_range"])
     parser.add_argument("--stop-range", type=float, default=defaults["stop_range"])
     parser.add_argument("--arrival-radius", type=float, default=defaults["arrival_radius"])
+    parser.add_argument("--fly-through-radius", type=float, default=1.2,
+                        help="accept a rolling fly-through waypoint inside this radius")
     parser.add_argument("--max-decel", type=float, default=defaults["max_decel"],
                         help="horizontal braking envelope in m/s^2")
     parser.add_argument("--control-latency", type=float, default=defaults["control_latency"],
@@ -984,7 +1024,7 @@ def main():
                 leg = navigate_to_goal(
                     sock, mav, mav_cmd, sys_id, comp_id, hb, receiver, origin,
                     args, map_data, goal_id, goal, bool(step.get("vision")),
-                    vision_scanner, result)
+                    bool(step.get("fly_through")), vision_scanner, result)
                 result["legs"].append(leg)
                 last_target = tuple(leg["goal_position_m"])
             elif step["action"] == "hover":

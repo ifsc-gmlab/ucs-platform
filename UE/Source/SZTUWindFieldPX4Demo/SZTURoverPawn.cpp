@@ -4,6 +4,7 @@
 #include "Components/StaticMeshComponent.h"
 #include "Engine/StaticMesh.h"
 #include "SZTUMavlinkSITLComponent.h"
+#include "SZTUFlightControllerComponent.h"
 #include "SZTUWindFieldPX4Demo.h"
 #include "UObject/ConstructorHelpers.h"
 #include "Materials/MaterialInstanceDynamic.h"

@@ -14,7 +14,9 @@
 #include "Engine/SkyLight.h"
 #include "Engine/StaticMeshActor.h"
 #include "Engine/StaticMesh.h"
+#include "Engine/Texture2D.h"
 #include "Engine/TextRenderActor.h"
+#include "Factories/TextureFactory.h"
 #include "Components/DirectionalLightComponent.h"
 #include "Components/PointLightComponent.h"
 #include "Components/SkyAtmosphereComponent.h"
@@ -25,6 +27,7 @@
 #include "Materials/Material.h"
 #include "Materials/MaterialExpressionScalarParameter.h"
 #include "Materials/MaterialExpressionMultiply.h"
+#include "Materials/MaterialExpressionTextureSample.h"
 #include "Materials/MaterialExpressionVectorParameter.h"
 #include "EngineUtils.h"
 #include "UObject/UObjectIterator.h"
@@ -161,6 +164,106 @@ static bool CreateColoredMaterial(
     const bool bSaved = UPackage::SavePackage(Package, M, *Filename, SaveArgs);
     UE_LOG(LogTemp, Display, TEXT("[BuildMaps] Saved material %s -> %s : %s"),
         *PackagePath, *Filename, bSaved ? TEXT("OK") : TEXT("FAILED"));
+    return bSaved;
+}
+
+static bool CreateBridgeTeamLogoMaterial()
+{
+    const FString SourcePath = FPaths::ProjectDir() /
+        TEXT("SourceArt/IFSC/IFSC-StationBrandImage.png");
+    if (!FPaths::FileExists(SourcePath))
+    {
+        UE_LOG(LogTemp, Error, TEXT("[BuildMaps] IFSC logo source missing: %s"), *SourcePath);
+        return false;
+    }
+
+    const FString TextureName = TEXT("T_IFSC_BridgeLogo");
+    const FString TexturePackagePath = TEXT("/Game/Drone/Brand/") + TextureName;
+    const FString TextureFilename = FPaths::ProjectContentDir() /
+        TEXT("Drone/Brand") / TextureName + TEXT(".uasset");
+    IFileManager::Get().MakeDirectory(
+        *(FPaths::ProjectContentDir() / TEXT("Drone/Brand")), true);
+    if (IFileManager::Get().FileExists(*TextureFilename))
+    {
+        IFileManager::Get().Delete(*TextureFilename);
+    }
+
+    UPackage* TexturePackage = CreatePackage(*TexturePackagePath);
+    if (!TexturePackage) { return false; }
+    TexturePackage->SetFlags(RF_Public | RF_Standalone);
+    UTextureFactory* TextureFactory = NewObject<UTextureFactory>();
+    if (!TextureFactory) { return false; }
+    bool bImportCanceled = false;
+    UTexture2D* Texture = Cast<UTexture2D>(TextureFactory->FactoryCreateFile(
+        UTexture2D::StaticClass(), TexturePackage, FName(*TextureName),
+        RF_Public | RF_Standalone, SourcePath, nullptr, GWarn, bImportCanceled));
+    if (!Texture || bImportCanceled)
+    {
+        UE_LOG(LogTemp, Error, TEXT("[BuildMaps] Failed to import IFSC logo texture"));
+        return false;
+    }
+    Texture->SRGB = true;
+    Texture->AddressX = TA_Clamp;
+    Texture->AddressY = TA_Clamp;
+    Texture->MarkPackageDirty();
+    FSavePackageArgs TextureSaveArgs;
+    TextureSaveArgs.Error = GError;
+    TextureSaveArgs.SaveFlags = SAVE_None;
+    if (!UPackage::SavePackage(TexturePackage, Texture, *TextureFilename, TextureSaveArgs))
+    {
+        UE_LOG(LogTemp, Error, TEXT("[BuildMaps] Failed to save IFSC logo texture"));
+        return false;
+    }
+
+    const FString MaterialName = TEXT("M_BridgeTeamLogo");
+    const FString MaterialPackagePath = TEXT("/Game/Drone/Materials/") + MaterialName;
+    const FString MaterialFilename = FPaths::ProjectContentDir() /
+        TEXT("Drone/Materials") / MaterialName + TEXT(".uasset");
+    if (IFileManager::Get().FileExists(*MaterialFilename))
+    {
+        IFileManager::Get().Delete(*MaterialFilename);
+    }
+    UPackage* MaterialPackage = CreatePackage(*MaterialPackagePath);
+    if (!MaterialPackage) { return false; }
+    MaterialPackage->SetFlags(RF_Public | RF_Standalone);
+    UMaterial* Material = NewObject<UMaterial>(MaterialPackage,
+        FName(*MaterialName), RF_Public | RF_Standalone);
+    if (!Material) { return false; }
+    Material->SetShadingModel(EMaterialShadingModel::MSM_Unlit);
+    Material->BlendMode = EBlendMode::BLEND_Masked;
+    Material->OpacityMaskClipValue = 0.08f;
+    // The logo is applied to a very thin box.  A two-sided masked material
+    // makes both the top and bottom faces visible through the transparent
+    // pixels at oblique camera angles, so the single drone emblem appears
+    // twice.  Keep only the upward-facing surface visible.
+    Material->TwoSided = false;
+    bool bNeedsRecompile = false;
+    Material->SetMaterialUsage(bNeedsRecompile, MATUSAGE_StaticLighting);
+
+    UMaterialExpressionTextureSample* Sample =
+        NewObject<UMaterialExpressionTextureSample>(Material, FName(TEXT("IFSCLogoTexture")));
+    if (!Sample) { return false; }
+    Sample->Texture = Texture;
+    Sample->SamplerType = SAMPLERTYPE_Color;
+    Sample->Material = Material;
+    Material->GetExpressionCollection().AddExpression(Sample);
+#if WITH_EDITORONLY_DATA
+    if (UMaterialEditorOnlyData* EOD = Material->GetEditorOnlyData())
+    {
+        EOD->EmissiveColor.Expression = Sample;
+        EOD->OpacityMask.Expression = Sample;
+        EOD->OpacityMask.Mask = 1;
+        EOD->OpacityMask.MaskA = 1;
+    }
+#endif
+    Material->MarkPackageDirty();
+    FSavePackageArgs MaterialSaveArgs;
+    MaterialSaveArgs.Error = GError;
+    MaterialSaveArgs.SaveFlags = SAVE_None;
+    const bool bSaved = UPackage::SavePackage(
+        MaterialPackage, Material, *MaterialFilename, MaterialSaveArgs);
+    UE_LOG(LogTemp, Display, TEXT("[BuildMaps] Saved IFSC bridge logo material: %s"),
+        bSaved ? TEXT("OK") : TEXT("FAILED"));
     return bSaved;
 }
 
@@ -349,14 +452,15 @@ static AStaticMeshActor* SpawnUrbanBox(
     const FVector& SizeM,
     const TCHAR* MaterialName,
     bool bCollision = true,
-    const TCHAR* SemanticId = nullptr)
+    const TCHAR* SemanticId = nullptr,
+    const FRotator& Rotation = FRotator::ZeroRotator)
 {
     UStaticMesh* Cube = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
     if (!World || !Cube) { return nullptr; }
 
     const FVector Location = BottomCenterCm + FVector(0.0f, 0.0f, SizeM.Z * 50.0f);
     AStaticMeshActor* Actor = World->SpawnActor<AStaticMeshActor>(
-        AStaticMeshActor::StaticClass(), Location, FRotator::ZeroRotator, SpawnParams);
+        AStaticMeshActor::StaticClass(), Location, Rotation, SpawnParams);
     if (!Actor || !Actor->GetStaticMeshComponent()) { return Actor; }
 
     UStaticMeshComponent* Component = Actor->GetStaticMeshComponent();
@@ -381,6 +485,414 @@ static AStaticMeshActor* SpawnUrbanBox(
         Actor->Tags.AddUnique(FName(*FString::Printf(TEXT("semantic:%s"), SemanticId)));
     }
     return Actor;
+}
+
+static bool BuildBridgeSemanticMap(const FString& MapName, bool bLargeBridge = false)
+{
+    const FString PackagePath = TEXT("/Game/Maps/") + MapName;
+    const FString OldFile = FPaths::ProjectContentDir() / TEXT("Maps") / MapName + TEXT(".umap");
+    if (IFileManager::Get().FileExists(*OldFile)) { IFileManager::Get().Delete(*OldFile); }
+
+    UPackage* Package = CreatePackage(*PackagePath);
+    if (!Package) { return false; }
+    Package->SetFlags(RF_Public | RF_Standalone);
+    UWorld* World = UWorld::CreateWorld(EWorldType::Editor, false, FName(*MapName), Package);
+    if (!World) { return false; }
+    World->SetFlags(RF_Public | RF_Standalone);
+    ConfigureWorldForRuntimeDemo(World);
+
+    FActorSpawnParameters SP;
+    SP.bNoFail = true;
+    SP.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+
+    const float DeckStartX = 250.0f;
+    const float DeckLengthCm = bLargeBridge ? 5000.0f : 3000.0f;
+    const float DeckEndX = DeckStartX + DeckLengthCm;
+    const float SceneCenterX = DeckStartX + DeckLengthCm * 0.5f;
+    const float DeckRiseCm = bLargeBridge ? 0.0f : 160.0f;
+    const float BridgeStartX = bLargeBridge ? 650.0f : 550.0f;
+    const float BridgeLengthCm = bLargeBridge ? 4200.0f : 2400.0f;
+    const int32 DeckSegmentCount = bLargeBridge ? 256 : 192;
+    const int32 ArchSegmentCount = bLargeBridge ? 256 : 192;
+
+    ASZTUDronePawn* Drone = World->SpawnActor<ASZTUDronePawn>(
+        ASZTUDronePawn::StaticClass(), FVector(250.0f, 0.0f, 0.0f), FRotator::ZeroRotator, SP);
+    if (Drone)
+    {
+        Drone->Airframe = ESZTUMultirotorAirframe::QuadX;
+        Drone->DroneId = 1;
+        Drone->bAutoSpawnWindField = false;
+        Drone->bEnableProximitySensors = true;
+        Drone->bEnableHorizontalCollisionSweep = true;
+        Drone->ProximityMaxRangeM = 12.0f;
+        Drone->ProximityUpdateRateHz = 10.0f;
+        Drone->AutoPossessPlayer = EAutoReceiveInput::Player0;
+    }
+    World->SpawnActor<APlayerStart>(APlayerStart::StaticClass(), FVector(250.0f, 0.0f, 0.0f), FRotator::ZeroRotator, SP);
+
+    bool bOk = Drone != nullptr;
+    // On the 50 m scene the bank blocks must stop at the deck endpoints.  The
+    // old blocks were centred on the endpoints, overlapping three metres of
+    // the bridge on each side; their exposed green top read as floating bars
+    // beside (and, from a low camera, across) the road.
+    const float LeftBankCenterX = bLargeBridge ? DeckStartX - 300.0f : 250.0f;
+    const float RightBankCenterX = bLargeBridge ? DeckEndX + 300.0f : DeckEndX;
+    const float BankBottomZ = bLargeBridge ? -25.0f : -12.5f;
+    bOk &= SpawnUrbanBox(World, SP, FVector(LeftBankCenterX, 0.0f, BankBottomZ), FVector(6.0f, 14.0f, 0.25f), TEXT("M_BridgeBank"), true) != nullptr;
+    bOk &= SpawnUrbanBox(World, SP, FVector(RightBankCenterX, 0.0f, BankBottomZ), FVector(6.0f, 14.0f, 0.25f), TEXT("M_BridgeBank"), true) != nullptr;
+    // The compact 30 m arch keeps water nearly level with its banks.  The 50 m
+    // suspension scene needs a visible drop below the deck so its tower legs can
+    // be read continuing from the bridge sides into the river.
+    const float WaterCenterZ = bLargeBridge ? -207.0f : -7.0f;
+    bOk &= SpawnUrbanBox(World, SP, FVector(SceneCenterX, 0.0f, WaterCenterZ),
+        FVector(bLargeBridge ? 44.0f : 24.0f, 30.0f, 0.12f), TEXT("M_BridgeWater"), false) != nullptr;
+    if (bLargeBridge)
+    {
+        // Retaining faces close the two-metre height transition at the river
+        // edges, avoiding a floating gap between the level approach banks and
+        // the lowered water plane.
+        for (float WallX : { DeckStartX, DeckEndX })
+        {
+            // Keep the two-metre retaining face below road level instead of
+            // letting its upper metre project across the bridge approach.
+            bOk &= SpawnUrbanBox(World, SP, FVector(WallX, 0.0f, -200.0f),
+                FVector(0.35f, 30.0f, 2.0f), TEXT("M_BridgeBank"), true) != nullptr;
+        }
+    }
+
+    // Humpback road deck: the drivable surface itself rises from the left bank
+    // to the crown and descends continuously to the right bank. Dense tangent
+    // segments keep it visually smooth and vehicle-accessible without steps.
+    const float DeckSegmentLengthCm = DeckLengthCm / DeckSegmentCount;
+    auto DeckHeightAtX = [DeckStartX, DeckLengthCm, DeckRiseCm](float X)
+    {
+        const float T = FMath::Clamp((X - DeckStartX) / DeckLengthCm, 0.0f, 1.0f);
+        return 5.0f + DeckRiseCm * FMath::Sin(PI * T);
+    };
+
+    const float ArchSegmentLengthCm = BridgeLengthCm / ArchSegmentCount;
+    auto ArchHeightCm = [bLargeBridge](float T)
+    {
+        // Arch springing sits at the water line; the crown remains safely below
+        // the humpback deck. The previous negative baseline buried most of the
+        // arch after the river surface was corrected.
+        return -10.0f + (bLargeBridge ? 180.0f : 120.0f) * FMath::Sin(PI * T);
+    };
+
+    // Level bank roads meet the curved deck exactly at its low endpoints.
+    bOk &= SpawnUrbanBox(World, SP, FVector(100.0f, 0.0f, 1.5f),
+        FVector(3.0f, 8.0f, 0.03f), TEXT("M_BridgeDeck"), false) != nullptr;
+    bOk &= SpawnUrbanBox(World, SP, FVector(DeckEndX + 150.0f, 0.0f, 1.5f),
+        FVector(3.0f, 8.0f, 0.03f), TEXT("M_BridgeDeck"), false) != nullptr;
+
+    for (int32 Index = 0; Index < DeckSegmentCount; ++Index)
+    {
+        const float X0 = DeckStartX + Index * DeckSegmentLengthCm;
+        const float X1 = X0 + DeckSegmentLengthCm;
+        const float H0 = DeckHeightAtX(X0);
+        const float H1 = DeckHeightAtX(X1);
+        const float CenterX = (X0 + X1) * 0.5f;
+        const float SurfaceZ = (H0 + H1) * 0.5f;
+        const float PitchDeg = -FMath::RadiansToDegrees(
+            FMath::Atan2(H1 - H0, DeckSegmentLengthCm));
+        const float LengthM = FMath::Sqrt(
+            FMath::Square(DeckSegmentLengthCm) + FMath::Square(H1 - H0)) / 100.0f;
+        const FRotator DeckRotation(PitchDeg, 0.0f, 0.0f);
+
+        bOk &= SpawnUrbanBox(World, SP, FVector(CenterX, 0.0f, SurfaceZ - 9.0f),
+            FVector(LengthM + 0.08f, 8.0f, 0.18f), TEXT("M_BridgeDeck"), true,
+            nullptr, DeckRotation) != nullptr;
+        for (float EdgeY : { -305.0f, 305.0f })
+        {
+            bOk &= SpawnUrbanBox(World, SP, FVector(CenterX, EdgeY, SurfaceZ + 1.5f),
+                FVector(LengthM + 0.08f, 0.10f, 0.025f), TEXT("M_BridgeRoadLine"), false,
+                nullptr, DeckRotation) != nullptr;
+        }
+        for (float RailY : { -388.0f, 388.0f })
+        {
+            for (float RailOffsetZ : { 42.0f, 78.0f })
+            {
+                bOk &= SpawnUrbanBox(World, SP, FVector(CenterX, RailY, SurfaceZ + RailOffsetZ),
+                    FVector(LengthM + 0.08f, 0.08f, 0.08f), TEXT("M_BridgeRail"), false,
+                    nullptr, DeckRotation) != nullptr;
+            }
+        }
+    }
+
+    for (float DashX = DeckStartX + 50.0f; DashX <= DeckEndX - 50.0f; DashX += 220.0f)
+    {
+        const float H0 = DeckHeightAtX(DashX - 55.0f);
+        const float H1 = DeckHeightAtX(DashX + 55.0f);
+        const float PitchDeg = -FMath::RadiansToDegrees(FMath::Atan2(H1 - H0, 110.0f));
+        bOk &= SpawnUrbanBox(World, SP, FVector(DashX, 0.0f, DeckHeightAtX(DashX) + 1.5f),
+            FVector(1.1f, 0.09f, 0.025f), TEXT("M_BridgeRoadLine"), false,
+            nullptr, FRotator(PitchDeg, 0.0f, 0.0f)) != nullptr;
+    }
+    for (float RailY : { -388.0f, 388.0f })
+    {
+        // Offset rail posts from the spandrel-column grid. When both grids shared
+        // an X coordinate, perspective merged them into one column that appeared
+        // to pierce through the road deck.
+        for (float PostX = DeckStartX + 75.0f; PostX <= DeckStartX + DeckLengthCm - 75.0f; PostX += 150.0f)
+        {
+            bOk &= SpawnUrbanBox(World, SP, FVector(PostX, RailY, DeckHeightAtX(PostX) + 39.0f),
+                FVector(0.08f, 0.08f, 0.78f), TEXT("M_BridgeRail"), false) != nullptr;
+        }
+    }
+
+    if (bLargeBridge)
+    {
+        // Use two very thin non-colliding boxes rather than a single engine
+        // plane.  The white road-marking base guarantees contrast and the
+        // upper masked layer carries the supplied transparent IFSC artwork.
+        // Both sit only centimetres above the asphalt and never affect flight.
+        // DeckHeightAtX is the segment reference surface; the 18 cm deck box
+        // extends another 9 cm above it.  Keep the paint layers above that top
+        // face instead of burying them inside the road slab.
+        const float LogoDeckTopZ = DeckHeightAtX(SceneCenterX) + 9.0f;
+        AStaticMeshActor* LogoBase = SpawnUrbanBox(
+            World, SP, FVector(SceneCenterX, 0.0f, LogoDeckTopZ + 1.2f),
+            FVector(6.4f, 3.2f, 0.012f), TEXT("M_BridgeRoadLine"), false,
+            TEXT("team_logo_base"));
+        AStaticMeshActor* TeamLogo = SpawnUrbanBox(
+            World, SP, FVector(SceneCenterX, 0.0f, LogoDeckTopZ + 2.6f),
+            FVector(5.8f, 2.7f, 0.012f), TEXT("M_BridgeTeamLogo"), false,
+            TEXT("team_logo"), FRotator(0.0f, 180.0f, 0.0f));
+        if (LogoBase && LogoBase->GetStaticMeshComponent())
+        {
+            LogoBase->GetStaticMeshComponent()->SetCastShadow(false);
+            LogoBase->Tags.AddUnique(TEXT("SZTU.TeamLogoBase"));
+        }
+        if (TeamLogo && TeamLogo->GetStaticMeshComponent())
+        {
+            TeamLogo->GetStaticMeshComponent()->SetCastShadow(false);
+            TeamLogo->Tags.AddUnique(TEXT("SZTU.TeamLogo"));
+        }
+        bOk &= LogoBase != nullptr && TeamLogo != nullptr;
+    }
+
+    if (!bLargeBridge)
+    {
+        for (int32 Index = 0; Index < ArchSegmentCount; ++Index)
+        {
+            const float T0 = static_cast<float>(Index) / ArchSegmentCount;
+            const float T1 = static_cast<float>(Index + 1) / ArchSegmentCount;
+            const float CenterX = BridgeStartX + (Index + 0.5f) * ArchSegmentLengthCm;
+            const float A0 = ArchHeightCm(T0);
+            const float A1 = ArchHeightCm(T1);
+            const float ArchCenterZ = (A0 + A1) * 0.5f;
+            const float ArchPitchDeg = -FMath::RadiansToDegrees(FMath::Atan2(A1 - A0, ArchSegmentLengthCm));
+            const float ArchLengthM = FMath::Sqrt(FMath::Square(ArchSegmentLengthCm) + FMath::Square(A1 - A0)) / 100.0f;
+            const FRotator ArchRotation(ArchPitchDeg, 0.0f, 0.0f);
+            for (float RibY : { -315.0f, 315.0f })
+            {
+                bOk &= SpawnUrbanBox(World, SP, FVector(CenterX, RibY, ArchCenterZ - 30.0f),
+                    FVector(ArchLengthM + 0.08f, 0.82f, 0.78f), TEXT("M_BridgeArch"), true, nullptr, ArchRotation) != nullptr;
+            }
+        }
+
+        // Spandrel columns connect each arch rib to the road deck.
+        for (float ColumnX = BridgeStartX + 200.0f; ColumnX <= BridgeStartX + BridgeLengthCm - 200.0f;
+            ColumnX += 200.0f)
+        {
+            const float T = (ColumnX - BridgeStartX) / BridgeLengthCm;
+            const float ArchTop = ArchHeightCm(T);
+            const float DeckBottom = DeckHeightAtX(ColumnX) - 18.0f;
+            const float ColumnTop = DeckBottom - 8.0f;
+            const float ColumnHeightCm = FMath::Max(12.0f, ColumnTop - ArchTop);
+            const float ColumnHeightM = ColumnHeightCm / 100.0f;
+            const float ColumnCenterZ = (ArchTop + ColumnTop) * 0.5f;
+            for (float ColumnY : { -280.0f, 280.0f })
+            {
+                bOk &= SpawnUrbanBox(World, SP, FVector(ColumnX, ColumnY, ColumnCenterZ),
+                    FVector(0.24f, 0.34f, ColumnHeightM), TEXT("M_BridgeArch"), true) != nullptr;
+            }
+        }
+    }
+    else
+    {
+        // Reference-driven 50 m suspension bridge: two towers, a sagging main
+        // cable on each side, and vertical hangers supporting a level deck.
+        constexpr float LeftTowerX = 1050.0f;
+        constexpr float RightTowerX = 4450.0f;
+        constexpr float TowerTopZ = 720.0f;
+        constexpr float CableAnchorZ = 245.0f;
+        constexpr float CableSagZ = 330.0f;
+        constexpr float TowerLegY = 430.0f;
+        constexpr float CableY = TowerLegY;
+        constexpr float TowerLegBottomZ = -330.0f;
+
+        for (float TowerX : { LeftTowerX, RightTowerX })
+        {
+            for (float TowerY : { -TowerLegY, TowerLegY })
+            {
+                // Put the legs just outside the deck edges and continue each one
+                // as a single uninterrupted member below the waterline.  This
+                // keeps the bases visible instead of hiding them behind the deck.
+                const float TowerLegCenterZ = (TowerTopZ + TowerLegBottomZ) * 0.5f;
+                const float TowerLegHeightM = (TowerTopZ - TowerLegBottomZ) / 100.0f;
+                bOk &= SpawnUrbanBox(World, SP, FVector(TowerX, TowerY, TowerLegCenterZ),
+                    FVector(0.52f, 0.72f, TowerLegHeightM), TEXT("M_BridgeTower"), true) != nullptr;
+
+                // Use a lighter, slightly wider concrete pier below deck level.
+                // The dark tower material disappeared against the shaded bank,
+                // making a geometrically continuous leg still look suspended.
+                constexpr float PierTopZ = 28.0f;
+                const float PierCenterZ = (PierTopZ + TowerLegBottomZ) * 0.5f;
+                const float PierHeightM = (PierTopZ - TowerLegBottomZ) / 100.0f;
+                bOk &= SpawnUrbanBox(World, SP, FVector(TowerX, TowerY, PierCenterZ),
+                    FVector(0.70f, 0.90f, PierHeightM), TEXT("M_BridgeConcrete"), true) != nullptr;
+            }
+            bOk &= SpawnUrbanBox(World, SP, FVector(TowerX, 0.0f, 650.0f),
+                FVector(0.58f, 9.2f, 0.48f), TEXT("M_BridgeTower"), true) != nullptr;
+        }
+
+        auto MainCableHeightAtX = [=](float X)
+        {
+            if (X <= LeftTowerX)
+            {
+                return FMath::Lerp(CableAnchorZ, TowerTopZ,
+                    FMath::Clamp((X - DeckStartX) / (LeftTowerX - DeckStartX), 0.0f, 1.0f));
+            }
+            if (X >= RightTowerX)
+            {
+                return FMath::Lerp(TowerTopZ, CableAnchorZ,
+                    FMath::Clamp((X - RightTowerX) / (DeckEndX - RightTowerX), 0.0f, 1.0f));
+            }
+            const float T = (X - LeftTowerX) / (RightTowerX - LeftTowerX);
+            const float Centered = 2.0f * T - 1.0f;
+            return CableSagZ + (TowerTopZ - CableSagZ) * Centered * Centered;
+        };
+
+        constexpr int32 CableSegmentCount = 160;
+        const float CableSegmentX = DeckLengthCm / CableSegmentCount;
+        for (int32 Index = 0; Index < CableSegmentCount; ++Index)
+        {
+            const float X0 = DeckStartX + Index * CableSegmentX;
+            const float X1 = X0 + CableSegmentX;
+            const float Z0 = MainCableHeightAtX(X0);
+            const float Z1 = MainCableHeightAtX(X1);
+            const float CableLengthM = FMath::Sqrt(FMath::Square(CableSegmentX) + FMath::Square(Z1 - Z0)) / 100.0f;
+            const FRotator CableRotation(-FMath::RadiansToDegrees(FMath::Atan2(Z1 - Z0, CableSegmentX)), 0.0f, 0.0f);
+            for (float SideY : { -CableY, CableY })
+            {
+                bOk &= SpawnUrbanBox(World, SP, FVector((X0 + X1) * 0.5f, SideY, (Z0 + Z1) * 0.5f),
+                    FVector(CableLengthM + 0.04f, 0.055f, 0.055f), TEXT("M_BridgeCable"), false,
+                    nullptr, CableRotation) != nullptr;
+            }
+        }
+
+        for (float HangerX = LeftTowerX + 200.0f; HangerX <= RightTowerX - 200.0f; HangerX += 200.0f)
+        {
+            const float CableZ = MainCableHeightAtX(HangerX);
+            const float HangerBottomZ = DeckHeightAtX(HangerX) + 22.0f;
+            const float HangerHeightCm = CableZ - HangerBottomZ;
+            for (float SideY : { -CableY, CableY })
+            {
+                bOk &= SpawnUrbanBox(World, SP, FVector(HangerX, SideY, (CableZ + HangerBottomZ) * 0.5f),
+                    FVector(0.04f, 0.04f, HangerHeightCm / 100.0f), TEXT("M_BridgeCable"), false) != nullptr;
+            }
+        }
+    }
+
+    // The deck endpoints sit directly on the level bank surfaces, so no solid
+    // abutment blocks are added: the user explicitly removed the previous solid
+    // concrete blocks that protruded above the water at both ends.
+    // The 30 m bridge uses spandrel columns and continuous arch ribs; the 50 m
+    // suspension bridge uses uninterrupted tower legs that continue below water.
+
+    // Road damage is a set of thin, non-colliding surface marks rather than a
+    // raised obstacle. Plant/pest/bird observations remain metadata-only until
+    // realistic assets are available; crude cubes would contaminate training data.
+    const TArray<float> CrackPositions = bLargeBridge
+        ? TArray<float>{ 1500.0f, 2750.0f, 4050.0f }
+        : TArray<float>{ 1150.0f, 1730.0f, 2350.0f };
+    for (float CrackX : CrackPositions)
+    {
+        const float RoadPitchDeg = -FMath::RadiansToDegrees(FMath::Atan2(
+            DeckHeightAtX(CrackX + 25.0f) - DeckHeightAtX(CrackX - 25.0f), 50.0f));
+        for (const TTuple<FVector2D, float>& Branch : {
+            TTuple<FVector2D, float>(FVector2D(-24.0f, -36.0f), 28.0f),
+            TTuple<FVector2D, float>(FVector2D(18.0f, -8.0f), -34.0f),
+            TTuple<FVector2D, float>(FVector2D(42.0f, 24.0f), 17.0f),
+            TTuple<FVector2D, float>(FVector2D(-6.0f, 38.0f), 58.0f) })
+        {
+            AStaticMeshActor* Crack = SpawnUrbanBox(World, SP,
+                FVector(CrackX + Branch.Get<0>().X, Branch.Get<0>().Y, DeckHeightAtX(CrackX + Branch.Get<0>().X) + 1.0f),
+                FVector(0.62f, 0.012f, 0.002f), TEXT("M_BridgeCrack"), false,
+                TEXT("road_crack"), FRotator(RoadPitchDeg, Branch.Get<1>(), 0.0f));
+            bOk &= Crack != nullptr;
+        }
+    }
+
+    ASZTUWindFieldActor* Wind = World->SpawnActor<ASZTUWindFieldActor>(
+        ASZTUWindFieldActor::StaticClass(), FVector(SceneCenterX, 0.0f, 450.0f), FRotator::ZeroRotator, SP);
+    if (Wind)
+    {
+        Wind->WindAxis = FVector(0.0f, 1.0f, 0.0f);
+        Wind->BaseWindMps = 3.0f;
+        Wind->bUseFAWG05MeasuredCurve = false;
+        Wind->GustAmplitudeMps = 0.5f;
+        Wind->TurbulenceAmplitudeMps = 0.25f;
+        Wind->bShowFanArray = false;
+        Wind->bShowWindArrows = false;
+        Drone->WindFieldReference = Wind;
+    }
+    bOk &= Wind != nullptr;
+
+    ASkyAtmosphere* Sky = World->SpawnActor<ASkyAtmosphere>(ASkyAtmosphere::StaticClass(), FVector::ZeroVector, FRotator::ZeroRotator, SP);
+    // A deterministic pale-blue horizon keeps the bridge presentation usable
+    // on first launch even when SkyAtmosphere shaders are still warming up.
+    AStaticMeshActor* SkyBackdrop = SpawnUrbanBox(
+        // Cover steep upward review-camera rays as well as the normal horizon;
+        // a short wall left a black strip above the bridge on first launch.
+        // SpawnUrbanBox receives the bottom Z, not the center. Extend below the
+        // deck so both upward and downward camera rays hit the backdrop.
+        World, SP, FVector(SceneCenterX, 3500.0f, -10000.0f),
+        FVector(250.0f, 0.10f, 400.0f), TEXT("M_BridgeSky"), false,
+        TEXT("bridge_sky_backdrop"));
+    if (SkyBackdrop && SkyBackdrop->GetStaticMeshComponent())
+    {
+        SkyBackdrop->GetStaticMeshComponent()->SetCastShadow(false);
+        SkyBackdrop->Tags.AddUnique(TEXT("SZTU.BridgeSkyBackdrop"));
+    }
+    ADirectionalLight* Sun = World->SpawnActor<ADirectionalLight>(ADirectionalLight::StaticClass(), FVector(0.0f, 0.0f, 1200.0f), FRotator(-48.0f, -32.0f, 0.0f), SP);
+    if (Sun)
+    {
+        ConfigureDirectionalLight(Sun);
+        Sun->SetBrightness(3.0f);
+        if (UDirectionalLightComponent* SunComponent =
+            Cast<UDirectionalLightComponent>(Sun->GetLightComponent()))
+        {
+            // Without an atmosphere sun, the bridge SkyAtmosphere renders as
+            // a black void even though the bridge itself is lit.
+            SunComponent->SetAtmosphereSunLight(true);
+            SunComponent->SetLightColor(FLinearColor(1.0f, 0.94f, 0.86f));
+        }
+    }
+    APointLight* ArchFill = World->SpawnActor<APointLight>(
+        APointLight::StaticClass(), FVector(SceneCenterX, -1100.0f, 450.0f), FRotator::ZeroRotator, SP);
+    if (ArchFill && ArchFill->PointLightComponent)
+    {
+        ArchFill->PointLightComponent->SetMobility(EComponentMobility::Movable);
+        ArchFill->PointLightComponent->SetCastShadows(false);
+        ArchFill->PointLightComponent->SetIntensity(1500.0f);
+        ArchFill->PointLightComponent->SetAttenuationRadius(4200.0f);
+        ArchFill->PointLightComponent->SetLightColor(FLinearColor(0.78f, 0.86f, 1.0f));
+    }
+    bOk &= Sky && SkyBackdrop && Sun && ArchFill;
+
+    World->MarkPackageDirty();
+    const FString Filename = FPaths::ProjectContentDir() / TEXT("Maps") / MapName + TEXT(".umap");
+    FSavePackageArgs SaveArgs;
+    SaveArgs.Error = GError;
+    SaveArgs.bForceByteSwapping = false;
+    SaveArgs.bWarnOfLongFilename = true;
+    SaveArgs.SaveFlags = SAVE_None;
+    const bool bSaved = UPackage::SavePackage(Package, World, *Filename, SaveArgs);
+    UE_LOG(LogTemp, Display, TEXT("[BuildMaps] Bridge semantic map %s -> %s"), *Filename, bSaved ? TEXT("OK") : TEXT("FAILED"));
+    World->CleanupWorld();
+    return bOk && bSaved;
 }
 
 static bool SpawnSemanticAnchor(
@@ -1257,6 +1769,38 @@ int32 USZTUWindFieldBuildMapsCommandlet::Main(const FString& Params)
         return bUrbanOk ? 0 : 1;
     }
 
+    const bool bBuildSmallBridgeOnly = FParse::Param(*Params, TEXT("BridgeMapOnly"));
+    const bool bBuildLargeBridgeOnly = FParse::Param(*Params, TEXT("LargeBridgeMapOnly"));
+    if (bBuildSmallBridgeOnly || bBuildLargeBridgeOnly)
+    {
+        bool bBridgeOk = true;
+        bBridgeOk &= CreateColoredMaterial(TEXT("M_BridgeBank"), FLinearColor(0.20f, 0.27f, 0.16f));
+        bBridgeOk &= CreateColoredMaterial(TEXT("M_BridgeWater"), FLinearColor(0.04f, 0.24f, 0.38f), false, 0.20f, 0.55f, 0.06f);
+        bBridgeOk &= CreateColoredMaterial(TEXT("M_BridgeSky"), FLinearColor(0.20f, 0.48f, 0.72f), false, 0.92f, 0.0f, 0.18f);
+        bBridgeOk &= CreateColoredMaterial(TEXT("M_BridgeDeck"), FLinearColor(0.10f, 0.11f, 0.12f));
+        bBridgeOk &= CreateColoredMaterial(TEXT("M_BridgeRoadLine"), FLinearColor(0.92f, 0.92f, 0.88f), true);
+        bBridgeOk &= CreateColoredMaterial(TEXT("M_BridgeRail"), FLinearColor(0.24f, 0.27f, 0.29f));
+        bBridgeOk &= CreateColoredMaterial(TEXT("M_BridgeConcrete"), FLinearColor(0.36f, 0.38f, 0.40f));
+        bBridgeOk &= CreateColoredMaterial(TEXT("M_BridgeArch"), FLinearColor(0.24f, 0.25f, 0.26f), false, 0.88f, 0.02f, 0.0f);
+        bBridgeOk &= CreateColoredMaterial(TEXT("M_BridgeTower"), FLinearColor(0.58f, 0.60f, 0.62f), false, 0.82f, 0.04f, 0.0f);
+        bBridgeOk &= CreateColoredMaterial(TEXT("M_BridgeCable"), FLinearColor(0.055f, 0.065f, 0.075f), false, 0.62f, 0.10f, 0.0f);
+        bBridgeOk &= CreateColoredMaterial(TEXT("M_BridgeCrack"), FLinearColor(0.005f, 0.005f, 0.005f), true);
+        bBridgeOk &= CreateColoredMaterial(TEXT("M_BridgePlant"), FLinearColor(0.08f, 0.52f, 0.14f), false, 0.90f, 0.03f, 0.04f);
+        bBridgeOk &= CreateColoredMaterial(TEXT("M_BridgePest"), FLinearColor(0.96f, 0.60f, 0.02f), true);
+        bBridgeOk &= CreateColoredMaterial(TEXT("M_BridgeBird"), FLinearColor(0.06f, 0.06f, 0.07f), true);
+        if (bBuildLargeBridgeOnly)
+        {
+            bBridgeOk &= CreateBridgeTeamLogoMaterial();
+        }
+        const FString BridgeMapName = bBuildLargeBridgeOnly
+            ? TEXT("SZTULargeBridgeSemanticScene")
+            : TEXT("SZTUBridgeSemanticScene");
+        bBridgeOk &= BuildBridgeSemanticMap(BridgeMapName, bBuildLargeBridgeOnly);
+        UE_LOG(LogTemp, Display, TEXT("[BuildMaps] %s map only: %s"), *BridgeMapName,
+            bBridgeOk ? TEXT("OK") : TEXT("FAILED"));
+        return bBridgeOk ? 0 : 1;
+    }
+
     bool bOk = true;
     // 机身：橙色 + 自发光 0.35，让远处能看到一个亮橙点（factory-wind 场景运行时会被黄色 MID 覆盖 BaseColor，
     // 但 AmbientFill 参数由材质保留，MID 继承后仍有自发光）。
@@ -1287,6 +1831,8 @@ int32 USZTUWindFieldBuildMapsCommandlet::Main(const FString& Params)
     bOk &= BuildFactoryFlightMap(TEXT("SZTUFactoryWindScene"), true);
     bOk &= BuildFactoryFlightMap(TEXT("SZTUFactoryDualScene"), true, 2);  // 双机场景
     bOk &= BuildUrbanSemanticMap(TEXT("SZTUUrbanSemanticScene"));
+    bOk &= BuildBridgeSemanticMap(TEXT("SZTUBridgeSemanticScene"));
+    bOk &= BuildBridgeSemanticMap(TEXT("SZTULargeBridgeSemanticScene"), true);
     bOk &= BuildCombinedMap(TEXT("CombinedSceneMap"));
     bOk &= AddFlagAndDroneToDemoScene(TEXT("SZTUWindFieldDemoScene"));
     UE_LOG(LogTemp, Display, TEXT("[BuildMaps] 完成。结果=%s"), bOk ? TEXT("成功") : TEXT("失败"));

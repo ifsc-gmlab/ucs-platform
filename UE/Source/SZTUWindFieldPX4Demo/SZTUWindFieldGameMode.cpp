@@ -1,6 +1,7 @@
 #include "SZTUWindFieldGameMode.h"
 #include "Camera/CameraActor.h"
 #include "Camera/CameraComponent.h"
+#include "Components/SceneCaptureComponent2D.h"
 #include "EngineUtils.h"
 #include "GameFramework/PlayerController.h"
 #include "SZTUDronePawn.h"
@@ -12,9 +13,60 @@
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Components/StaticMeshComponent.h"
 #include "Components/TextRenderComponent.h"
+#include "Engine/Canvas.h"
+#include "Engine/GameViewportClient.h"
+#include "Engine/TextureRenderTarget2D.h"
+#include "UnrealClient.h"
+#include "TimerManager.h"
+#include "Styling/SlateBrush.h"
+#include "Widgets/Images/SImage.h"
+#include "Widgets/Layout/SBorder.h"
+#include "Widgets/Layout/SBox.h"
+#include "Widgets/SBoxPanel.h"
+#include "Widgets/SOverlay.h"
+#include "Widgets/Text/STextBlock.h"
+
+void ASZTUDualCameraHUD::DrawHUD()
+{
+    Super::DrawHUD();
+    if (!FParse::Param(FCommandLine::Get(), TEXT("DualCameraView")) || !Canvas)
+    {
+        return;
+    }
+
+    ASZTUDronePawn* Drone = nullptr;
+    for (TActorIterator<ASZTUDronePawn> It(GetWorld()); It; ++It)
+    {
+        Drone = *It;
+        break;
+    }
+    UTextureRenderTarget2D* RenderTarget = Drone ? Drone->GetCaptureRenderTarget() : nullptr;
+    if (!RenderTarget)
+    {
+        return;
+    }
+
+    const float Margin = 22.0f;
+    const float PanelWidth = Canvas->SizeX * 0.40f;
+    const float ImageWidth = PanelWidth - 16.0f;
+    const float ImageHeight = ImageWidth * 9.0f / 16.0f;
+    const float PanelHeight = ImageHeight + 48.0f;
+    const float X = Canvas->SizeX - PanelWidth - Margin;
+    const float Y = Margin;
+    DrawRect(FLinearColor(0.01f, 0.015f, 0.02f, 0.94f), X, Y, PanelWidth, PanelHeight);
+    DrawText(TEXT("机载相机 / ONBOARD CAMERA"), FLinearColor::White,
+        X + 10.0f, Y + 7.0f, nullptr, 1.0f, false);
+    DrawTexture(RenderTarget, X + 8.0f, Y + 38.0f, ImageWidth, ImageHeight,
+        0.0f, 0.0f, 1.0f, 1.0f, FLinearColor::White,
+        BLEND_Opaque, 1.0f, false, 0.0f, FVector2D::ZeroVector);
+}
 
 ASZTUWindFieldGameMode::ASZTUWindFieldGameMode()
 {
+    if (FParse::Param(FCommandLine::Get(), TEXT("DualCameraView")))
+    {
+        HUDClass = ASZTUDualCameraHUD::StaticClass();
+    }
     // Check -Vehicle=rover in constructor (before any pawn is spawned,
     // including the transition scene). This prevents a DronePawn from
     // being spawned first and grabbing TCP port 4560.
@@ -173,6 +225,32 @@ void ASZTUWindFieldGameMode::StartPlay()
             CameraLookAt = FVector(0.0f, 150.0f, 110.0f);
             CameraFOV = 68.0f;
         }
+        else if (MapName.Contains(TEXT("SZTULargeBridgeSemanticScene")))
+        {
+            if (FParse::Param(FCommandLine::Get(), TEXT("LogoReviewCamera")))
+            {
+                // Reproducible oblique close-up for checking transparent Logo
+                // layers without starting PX4 or moving the aircraft.
+                CameraLocation = FVector(2750.0f, -1050.0f, 520.0f);
+                CameraLookAt = FVector(2750.0f, 0.0f, 18.0f);
+                CameraFOV = 48.0f;
+            }
+            else
+            {
+                CameraLocation = FVector(2750.0f, -4300.0f, 1250.0f);
+                CameraLookAt = FVector(2750.0f, 0.0f, 20.0f);
+                CameraFOV = 70.0f;
+            }
+        }
+        else if (MapName.Contains(TEXT("SZTUBridgeSemanticScene")))
+        {
+            // Operator overview: show both bridgeheads, the full arch profile,
+            // the aircraft, and the water in one frame. The independent
+            // VisionCapture component still records onboard inspection images.
+            CameraLocation = FVector(1750.0f, -2700.0f, 850.0f);
+            CameraLookAt = FVector(1750.0f, 0.0f, 40.0f);
+            CameraFOV = 68.0f;
+        }
         else if (MapName.Contains(TEXT("SZTUUrbanSemanticScene")))
         {
             // View the corridor from +Y toward -Y. The previous -Y camera made
@@ -226,6 +304,87 @@ void ASZTUWindFieldGameMode::StartPlay()
                     *CameraLocation.ToString(),
                     *CameraLookAt.ToString(),
                     CameraFOV);
+
+                if (FParse::Param(FCommandLine::Get(), TEXT("FollowDroneCamera")))
+                {
+                    if (UCameraComponent* FollowCameraComponent = Camera->GetCameraComponent())
+                    {
+                        FollowCameraComponent->SetFieldOfView(55.0f);
+                    }
+                    ASZTUDronePawn* FollowDrone = nullptr;
+                    for (TActorIterator<ASZTUDronePawn> It(GetWorld()); It; ++It)
+                    {
+                        FollowDrone = *It;
+                        break;
+                    }
+                    if (FollowDrone)
+                    {
+                        if (FParse::Param(FCommandLine::Get(), TEXT("DualCameraView")) &&
+                            FollowDrone->VisionCapture && FollowDrone->GetCaptureRenderTarget() &&
+                            GEngine && GEngine->GameViewport)
+                        {
+                            // Render the onboard view every frame for the video
+                            // overlay. Disk PNG readback remains at its configured
+                            // low rate, so this does not add per-frame CPU encoding.
+                            FollowDrone->VisionCapture->bCaptureEveryFrame = true;
+                            FollowDrone->VisionCapture->bCaptureOnMovement = true;
+
+                            UE_LOG(LogSZTUWindField, Display,
+                                TEXT("Dual-camera HUD active (follow + onboard)."));
+                        }
+
+                        TWeakObjectPtr<ACameraActor> WeakCamera(Camera);
+                        TWeakObjectPtr<ASZTUDronePawn> WeakDrone(FollowDrone);
+                        FTimerHandle FollowCameraTimer;
+                        GetWorldTimerManager().SetTimer(FollowCameraTimer,
+                            [WeakCamera, WeakDrone]()
+                            {
+                                if (!WeakCamera.IsValid() || !WeakDrone.IsValid())
+                                {
+                                    return;
+                                }
+                                const FVector DroneLocation = WeakDrone->GetActorLocation();
+                                if (DroneLocation.Z < 100.0f)
+                                {
+                                    // Before takeoff, use a raised staging view so
+                                    // the bank/deck edge cannot occlude the vehicle.
+                                    // Place the camera over the river-side shoulder,
+                                    // not behind the near-bank slab.
+                                    const FVector StagingLocation = DroneLocation + FVector(250.0f, -750.0f, 450.0f);
+                                    const FVector StagingLookAt = DroneLocation + FVector(0.0f, 0.0f, 18.0f);
+                                    WeakCamera->SetActorLocationAndRotation(
+                                        StagingLocation, (StagingLookAt - StagingLocation).Rotation());
+                                    return;
+                                }
+                                // Follow from the outside of the orbit while looking
+                                // inward, keeping the aircraft in the foreground and
+                                // the bridge in the background on every side.
+                                const FVector BridgeCenter(2750.0f, 0.0f, 100.0f);
+                                FVector Outward(
+                                    DroneLocation.X - BridgeCenter.X,
+                                    DroneLocation.Y - BridgeCenter.Y,
+                                    0.0f);
+                                if (!Outward.Normalize())
+                                {
+                                    Outward = FVector(0.0f, -1.0f, 0.0f);
+                                }
+                                const FVector FollowLocation = DroneLocation + Outward * 650.0f + FVector(0.0f, 0.0f, 350.0f);
+                                const FVector LookAt = DroneLocation - Outward * 180.0f + FVector(0.0f, 0.0f, -20.0f);
+                                constexpr float FollowUpdateSeconds = 0.02f;
+                                const FVector SmoothedLocation = FMath::VInterpTo(
+                                    WeakCamera->GetActorLocation(), FollowLocation,
+                                    FollowUpdateSeconds, 3.2f);
+                                const FRotator SmoothedRotation = FMath::RInterpTo(
+                                    WeakCamera->GetActorRotation(),
+                                    (LookAt - SmoothedLocation).Rotation(),
+                                    FollowUpdateSeconds, 4.0f);
+                                WeakCamera->SetActorLocationAndRotation(
+                                    SmoothedLocation, SmoothedRotation);
+                            }, 0.02f, true, 0.0f);
+                        UE_LOG(LogSZTUWindField, Display,
+                            TEXT("Third-person follow camera active on DroneId=%d"), FollowDrone->DroneId);
+                    }
+                }
             }
             else
             {
@@ -240,6 +399,24 @@ void ASZTUWindFieldGameMode::StartPlay()
     else
     {
         UE_LOG(LogSZTUWindField, Display, TEXT("Observer camera disabled."));
+    }
+
+    // Opt-in visual regression artifact. The delayed request runs after the
+    // observer viewport has rendered, avoiding startup-time empty screenshots.
+    const bool bLargeBridgeReviewShot = FParse::Param(FCommandLine::Get(), TEXT("LargeBridgeReviewShot"));
+    if ((FParse::Param(FCommandLine::Get(), TEXT("BridgeReviewShot")) || bLargeBridgeReviewShot) && GetWorld())
+    {
+        FTimerHandle ReviewShotTimer;
+        GetWorldTimerManager().SetTimer(ReviewShotTimer, [bLargeBridgeReviewShot]()
+        {
+            const FString ShotPath = FPaths::ProjectSavedDir() /
+                (bLargeBridgeReviewShot
+                    ? TEXT("Screenshots/Windows/LargeBridgeArchReview.png")
+                    : TEXT("Screenshots/Windows/BridgeArchReview.png"));
+            IFileManager::Get().MakeDirectory(*FPaths::GetPath(ShotPath), true);
+            FScreenshotRequest::RequestScreenshot(ShotPath, false, false);
+            UE_LOG(LogSZTUWindField, Display, TEXT("Bridge review screenshot requested: %s"), *ShotPath);
+        }, 3.0f, false);
     }
 
     // Wind control UI:

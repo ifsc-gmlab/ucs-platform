@@ -48,7 +48,11 @@ def parse_buf(mav, data):
 def connect():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    for p in (14550, 51917, 0):
+    # UDP 14550 belongs exclusively to mavlink_relay.py so QGroundControl keeps
+    # receiving PX4 telemetry throughout an autonomous mission.  Binding the
+    # controller to the same reused port let it steal datagrams from the relay,
+    # which made QGC switch to Comms Lost as soon as step 1 began.
+    for p in (51917, 0):
         try:
             sock.bind(("0.0.0.0", p))
             break
@@ -311,7 +315,8 @@ def fly_circle(sock, mav, mav_cmd, sys_id, comp_id, hb,
 
 def retry_clean_disarm(sock, mav, mav_cmd, sys_id, comp_id, hb, x, y, attempts=4):
     for attempt in range(1, attempts + 1):
-        if disarm(sock, mav, mav_cmd, sys_id, comp_id, hb, force=False):
+        if disarm(sock, mav, mav_cmd, sys_id, comp_id, hb, force=False,
+                  ground_x=x, ground_y=y):
             return True
         if attempt < attempts:
             print("[!] clean DISARM denied -> holding on ground before retry %d/%d" % (attempt, attempts))
@@ -319,10 +324,13 @@ def retry_clean_disarm(sock, mav, mav_cmd, sys_id, comp_id, hb, x, y, attempts=4
     return False
 
 
-def disarm(sock, mav, mav_cmd, sys_id, comp_id, hb, force=False, confirm=True):
+def disarm(sock, mav, mav_cmd, sys_id, comp_id, hb, force=False, confirm=True,
+           ground_x=None, ground_y=None):
     """Send DISARM. If confirm=True, accept either a successful ARM_DISARM ACK
     or a HEARTBEAT whose armed bit is clear. PX4 can apply the command while the
-    corresponding ACK is lost among high-rate HIL traffic."""
+    corresponding ACK is lost among high-rate HIL traffic. When ground_x/y are
+    supplied after UE-confirmed touchdown, keep streaming the same bounded
+    touchdown setpoint so OFFBOARD does not time out while PX4 answers."""
     print("[*] DISARM%s ..." % (" (force)" if force else ""))
     # MAV_CMD_COMPONENT_ARM_DISARM uses the magic value 21196 for force disarm.
     # param2=1 is not a force-disarm request and PX4 keeps rejecting it as
@@ -336,9 +344,13 @@ def disarm(sock, mav, mav_cmd, sys_id, comp_id, hb, force=False, confirm=True):
     # PX4 echoes the ACK back to this port; result==0 means disarmed.
     t0 = time.time()
     while time.time() - t0 < 3.0:
+        if ground_x is not None and ground_y is not None:
+            send_touchdown_setpoint(
+                sock, mav, mav_cmd, sys_id, comp_id,
+                ground_x, ground_y, DEFAULT_TOUCHDOWN_SPEED)
         send_hb(sock, mav, hb)
         try:
-            sock.settimeout(0.3)
+            sock.settimeout(0.1)
             data, _ = sock.recvfrom(4096)
             for m in parse_buf(mav, data):
                 if m.get_type() == "COMMAND_ACK" and m.command == MAV.MAV_CMD_COMPONENT_ARM_DISARM:
@@ -494,7 +506,8 @@ def main():
     if not retry_clean_disarm(sock, mav, mav_cmd, sys_id, comp_id, hb, target_x, target_y, attempts=1):
         if landed:
             print("[!] clean DISARM still denied at confirmed ground contact -> force disarm")
-            disarm(sock, mav, mav_cmd, sys_id, comp_id, hb, force=True)
+            disarm(sock, mav, mav_cmd, sys_id, comp_id, hb, force=True,
+                   ground_x=target_x, ground_y=target_y)
         else:
             print("[!] skipping force DISARM because UE ground contact was not confirmed")
             return 4

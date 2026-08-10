@@ -86,6 +86,16 @@ if [ "$INSTANCE" -gt 1 ]; then
 else
   PX4_ROOTFS="$PX4_ROOT/build/px4_sitl_default/rootfs"
 fi
+# A clean `make px4_sitl` creates the generated ROMFS tree as a sibling of
+# rootfs. Reconnect it here when the runtime rootfs was recreated/emptied;
+# otherwise PX4 starts but immediately reports that etc/init.d-posix/rcS is
+# missing and never opens the UE simulator connection.
+if [ ! -f "$PX4_ROOTFS/etc/init.d-posix/rcS" ]; then
+  mkdir -p "$PX4_ROOTFS"
+  rm -f "$PX4_ROOTFS/etc"
+  ln -s ../etc "$PX4_ROOTFS/etc"
+  echo "[launch] linked generated ROMFS: $PX4_ROOTFS/etc -> ../etc"
+fi
 FIFO="/tmp/px4_cmd_fifo_${INSTANCE}"
 MPC_Z_P_VALUE="${SZTU_MPC_Z_P:-1.5}"
 MPC_Z_VEL_P_ACC_VALUE="${SZTU_MPC_Z_VEL_P_ACC:-3.0}"

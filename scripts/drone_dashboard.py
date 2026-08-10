@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SZTU Drone Wind-Field Simulation — Three-Window Web Dashboard
+IFSC Bridge Inspection Platform — Three-Window Web Dashboard
 =============================================================
 Panels:
   1. Drone Status  — real-time telemetry (position, velocity, attitude, sensors, wind)
@@ -28,6 +28,7 @@ Open http://localhost:8080 in a browser.
 """
 
 import json
+import socket
 import math
 import os
 import re
@@ -45,6 +46,8 @@ from semantic_route_planner import (
     plan_safe_route,
 )
 from semantic_runtime_config import load_runtime_config
+from semantic_explainability import (
+    ExplainabilityStore, canonical_sha256, file_sha256, public_summary)
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import parse_qs
 
@@ -74,9 +77,12 @@ def _decode_bytes(raw):
 
 # ─── Configuration ──────────────────────────────────────────────────────────
 DEFAULT_PORT = 8080
+SERVER_PORT = DEFAULT_PORT
 DEFAULT_TELEMETRY_PORT = 14660
 DEFAULT_MAP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "urban_semantic_map.json")
 DEFAULT_UE_MAP = ""
+MAP_DATA = {}
+DASHBOARD_CONFIG = {}
 RUNTIME_CONFIG = load_runtime_config()
 CAMERA_PREVIEW_POLL_MS = int(
     RUNTIME_CONFIG["camera"]["preview_poll_ms"])
@@ -98,11 +104,21 @@ def load_map_dispatch_config(path):
 
 # Strict whitelist of goal ids the dashboard is allowed to dispatch.
 GOAL_WHITELIST, DEFAULT_UE_MAP = load_map_dispatch_config(DEFAULT_MAP)
-# WSL-side controller + camera artifact locations (fixed, not user-supplied).
+with open(DEFAULT_MAP, "r", encoding="utf-8-sig") as _default_map_file:
+    MAP_DATA = json.load(_default_map_file)
+DASHBOARD_CONFIG = MAP_DATA.get("dashboard", {})
+# Runtime locations are configurable for server migration.  The legacy project
+# folder name remains the default because UE asset/module identifiers are still
+# compatibility-critical; the public product name is IFSC.
 WSL_DISTRO = "Ubuntu"
 WSL_CONTROLLER_DIR = "~/szefitl"
-WSL_CAMERA_DIR = "/mnt/d/SZTUWindFieldPX4Demo/Unreal/Saved/CameraFrames"
-CAMERA_FRAMES_WINDOWS_DIR = r"D:\SZTUWindFieldPX4Demo\Unreal\Saved\CameraFrames"
+UE_PROJECT_ROOT = os.environ.get(
+    "IFSC_UE_PROJECT_ROOT", r"D:\SZTUWindFieldPX4Demo\Unreal")
+CAMERA_FRAMES_WINDOWS_DIR = os.path.join(
+    UE_PROJECT_ROOT, "Saved", "CameraFrames")
+_ue_drive, _ue_tail = os.path.splitdrive(UE_PROJECT_ROOT)
+WSL_CAMERA_DIR = "/mnt/%s/%s/Saved/CameraFrames" % (
+    _ue_drive[:1].lower(), _ue_tail.lstrip("\\/").replace("\\", "/"))
 # Windows-side source files that we mirror into WSL so the run command stays
 # pure-ASCII (avoids GBK/UTF-8 path-encoding issues on the Windows side).
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -294,6 +310,43 @@ GOAL_LABELS = {
     "medical_station": "医疗站",
 }
 
+BRIDGE_GOAL_KEYWORDS = {
+    "start_pad": ["起点", "起飞点", "近岸", "近端", "返航", "回家"],
+    "bridge_entry": ["桥入口", "入口", "进桥"],
+    "bridge_ascent": ["上升点", "上坡", "拱桥上升"],
+    "bridge_apex": ["最高点", "拱顶", "桥顶"],
+    "bridge_descent": ["下降点", "下坡", "拱桥下降"],
+    "bridge_exit": ["桥出口", "出口", "桥尾"],
+    "far_pad": ["对岸", "远岸", "终点", "远端", "降落点"],
+}
+
+
+def _refresh_map_runtime_config(map_data):
+    """Refresh labels and UI settings after --map selects a new mission map."""
+    global MAP_DATA, DASHBOARD_CONFIG, GOAL_LABELS
+    MAP_DATA = map_data
+    DASHBOARD_CONFIG = map_data.get("dashboard", {})
+    GOAL_LABELS = {
+        str(goal_id): str(goal.get("display_label") or goal.get("label") or goal_id)
+        for goal_id, goal in map_data.get("goals", {}).items()
+    }
+
+
+def _dynamic_goal_from_text(text):
+    """Match configured goal aliases, including bridge-specific Chinese terms."""
+    if "bridge" not in str(MAP_DATA.get("map_id", "")).lower():
+        return None
+    lowered = text.lower()
+    for goal_id, goal in MAP_DATA.get("goals", {}).items():
+        tokens = [goal_id, goal.get("label", ""), goal.get("display_label", "")]
+        tokens.extend(goal.get("aliases", []))
+        tokens.extend(BRIDGE_GOAL_KEYWORDS.get(goal_id, []))
+        for token in tokens:
+            token = str(token).strip().lower()
+            if token and token in lowered:
+                return goal_id
+    return None
+
 def detect_vision_request(text):
     t = text.lower()
     return any(re.search(kw, t) for kw in VISION_KEYWORDS)
@@ -302,6 +355,11 @@ def parse_command(text):
     """Parse natural-language command text. Returns (action, goal_id, vision, reply)."""
     text_lower = text.lower().strip()
     vision = detect_vision_request(text_lower)
+    dynamic_goal = _dynamic_goal_from_text(text_lower)
+    if dynamic_goal:
+        label = GOAL_LABELS.get(dynamic_goal, dynamic_goal)
+        vnote = "（视觉确认模式）" if vision else ""
+        return "fly_to", dynamic_goal, vision, f"收到，目标设为：{label}{vnote}"
     for pattern, action, goal_id in COMMAND_RULES:
         if re.search(pattern, text_lower):
             if action == "fly_to":
@@ -508,6 +566,168 @@ def parse_command_with_deepseek(text):
 HISTORY_PATH = os.path.join(_THIS_DIR, "task_history.json")
 CURRENT_TASK_PATH = os.path.join(_THIS_DIR, "current_task.json")
 PLAN_DIR = os.path.join(_THIS_DIR, "task-plans")
+EXPLAINABILITY_DIR = os.path.join(_THIS_DIR, "semantic-explainability")
+explainability_store = ExplainabilityStore(EXPLAINABILITY_DIR)
+UNREAL_ROUTE_PREVIEW_PATH = os.path.join(
+    UE_PROJECT_ROOT, "Saved",
+    "semantic_route_preview.json")
+trajectory_preview_lock = threading.Lock()
+trajectory_preview_state = {
+    "fingerprint": None,
+    "generated_wall": None,
+    "path": UNREAL_ROUTE_PREVIEW_PATH,
+    "plan": None,
+    "route_point_count": 0,
+}
+
+
+def _plan_fingerprint(plan):
+    return json.dumps(plan, ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":"))
+
+
+def _create_explanation(raw_command, requested_vision, parser_name,
+                        fallback_reason, plan, source="command"):
+    return explainability_store.create(
+        raw_command=raw_command,
+        requested_vision=requested_vision,
+        parser_name=parser_name,
+        model=DEEPSEEK_MODEL if parser_name == "deepseek" else None,
+        fallback_reason=fallback_reason,
+        plan=plan,
+        map_path=DEFAULT_MAP,
+        map_data=MAP_DATA,
+        source=source,
+    )
+
+
+def _read_explanation_summary(explanation_id):
+    if not explanation_id:
+        return None
+    try:
+        return public_summary(explainability_store.read(explanation_id))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def generate_trajectory_preview(raw_steps, explanation_id=None):
+    """Validate a semantic plan and publish the exact UE5 route preview."""
+    plan = validate_plan(raw_steps)
+    review = build_plan_review(plan)
+    if review["blocked"]:
+        raise ValueError("轨迹规划失败：" + str(review["block_reason"]))
+
+    goals = MAP_DATA.get("goals", {})
+    obstacles = MAP_DATA.get("obstacles", [])
+    points = [{
+        "x_m": 0.0, "y_m": 0.0, "z_m": 0.25,
+        "label": "起飞点", "kind": "start",
+    }]
+    trajectory_legs = []
+    current_xy = (0.0, 0.0)
+    current_z = 0.25
+    previous_goal = "start_pad"
+    for step_index, step in enumerate(plan, start=1):
+        if step["action"] != "fly_to":
+            continue
+        goal_id = step["goal_id"]
+        goal = goals.get(goal_id, {})
+        position = goal.get("position_m", [0.0, 0.0])
+        target_xy = (float(position[0]), float(position[1]))
+        target_z = float(goal.get("altitude_m", 5.0))
+        planned = plan_safe_route(
+            current_xy, target_xy, obstacles, DEFAULT_CLEARANCE_M)
+        if planned is None:
+            raise ValueError("无法为 %s 生成安全轨迹" % goal_id)
+        conflicts = intersected_obstacle_ids(
+            current_xy, target_xy, obstacles, DEFAULT_CLEARANCE_M)
+        trajectory_legs.append({
+            "step": step_index,
+            "from": previous_goal,
+            "to": goal_id,
+            "direct_path_obstacles": conflicts,
+            "route_points_m": planned["points"],
+            "distance_m": planned["distance_m"],
+            "detour_waypoints": planned["detour_waypoints"],
+            "clearance_m": planned["clearance_m"],
+            "decision": (
+                "detour_around_map_obstacle"
+                if planned["detour_waypoints"] else "direct_path_clear"),
+        })
+        route_xy = planned["points"][1:]
+        leg_count = max(1, len(route_xy))
+        for point_index, point_xy in enumerate(route_xy, start=1):
+            alpha = point_index / float(leg_count)
+            is_target = point_index == leg_count
+            points.append({
+                "x_m": round(float(point_xy[0]), 3),
+                "y_m": round(float(point_xy[1]), 3),
+                "z_m": round(current_z + (target_z - current_z) * alpha, 3),
+                "label": (
+                    goal.get("display_label") or goal.get("label") or goal_id
+                    if is_target else "安全绕行点"),
+                "kind": "goal" if is_target else "detour",
+                "goal_id": goal_id if is_target else None,
+            })
+        current_xy = target_xy
+        current_z = target_z
+        previous_goal = goal_id
+
+    payload = {
+        "schema": "sztu.semantic_route_preview.v1",
+        "map_id": MAP_DATA.get("map_id"),
+        "frame": "PX4_LOCAL_NED",
+        "origin_world_m": MAP_DATA.get("origin_world_m", [0.0, 0.0, 0.0]),
+        "generated_wall": time.time(),
+        "plan_fingerprint": _plan_fingerprint(plan),
+        "route_points": points,
+        "trajectory_legs": trajectory_legs,
+        "plan": plan,
+    }
+    os.makedirs(os.path.dirname(UNREAL_ROUTE_PREVIEW_PATH), exist_ok=True)
+    temporary_path = UNREAL_ROUTE_PREVIEW_PATH + ".tmp"
+    with open(temporary_path, "w", encoding="utf-8") as route_file:
+        json.dump(payload, route_file, ensure_ascii=False, indent=2)
+    os.replace(temporary_path, UNREAL_ROUTE_PREVIEW_PATH)
+    with trajectory_preview_lock:
+        trajectory_preview_state.update({
+            "fingerprint": payload["plan_fingerprint"],
+            "generated_wall": payload["generated_wall"],
+            "path": UNREAL_ROUTE_PREVIEW_PATH,
+            "plan": plan,
+            "route_point_count": len(points),
+        })
+    if explanation_id:
+        explainability_store.update_plan(explanation_id, plan, MAP_DATA)
+    else:
+        record = _create_explanation(
+            "控制台任务队列", False, "operator", None, plan,
+            source="operator_plan")
+        explanation_id = record["explanation_id"]
+    explainability_store.attach_review(explanation_id, review)
+    trajectory_record = {
+        "schema": payload["schema"],
+        "frame": payload["frame"],
+        "generated_wall": payload["generated_wall"],
+        "preview_path": UNREAL_ROUTE_PREVIEW_PATH,
+        "preview_sha256": file_sha256(UNREAL_ROUTE_PREVIEW_PATH),
+        "plan_fingerprint": payload["plan_fingerprint"],
+        "route_point_count": len(points),
+        "route_points": points,
+        "legs": trajectory_legs,
+    }
+    record = explainability_store.attach_trajectory(
+        explanation_id, trajectory_record)
+    return {
+        "ok": True,
+        "plan": plan,
+        "review": review,
+        "route_point_count": len(points),
+        "trajectory_path": UNREAL_ROUTE_PREVIEW_PATH,
+        "generated_wall": payload["generated_wall"],
+        "explanation_id": explanation_id,
+        "explainability": public_summary(record),
+    }
 
 
 def _load_history():
@@ -658,9 +878,20 @@ def run_controller_task(task_id, goal_id, vision, plan=None):
             "-Goal", goal_id,
             "-SemanticMapFile", DEFAULT_MAP,
             "-UeMap", DEFAULT_UE_MAP,
-            "-MissionTimeoutSec", "70",
-            "-EstimatorSettleSec", "35",
+            "-ProjectRoot", UE_PROJECT_ROOT,
+            "-MissionTimeoutSec", str(int(DASHBOARD_CONFIG.get("mission_timeout_s", 70))),
+            "-EstimatorSettleSec", str(int(DASHBOARD_CONFIG.get("estimator_settle_s", 35))),
         ]
+        if DASHBOARD_CONFIG.get("archive_frames"):
+            cmd.append("-ArchiveFrames")
+        if DASHBOARD_CONFIG.get("camera_capture_hz") is not None:
+            cmd.extend(["-CameraCaptureHz", str(DASHBOARD_CONFIG["camera_capture_hz"])])
+        if DASHBOARD_CONFIG.get("camera_width") is not None:
+            cmd.extend(["-CameraWidth", str(int(DASHBOARD_CONFIG["camera_width"]))])
+        if DASHBOARD_CONFIG.get("camera_height") is not None:
+            cmd.extend(["-CameraHeight", str(int(DASHBOARD_CONFIG["camera_height"]))])
+        if DASHBOARD_CONFIG.get("wind_mps") is not None:
+            cmd.extend(["-WindMps", str(float(DASHBOARD_CONFIG["wind_mps"]))])
         if plan:
             os.makedirs(PLAN_DIR, exist_ok=True)
             plan_path = os.path.join(PLAN_DIR, task_id + ".json")
@@ -670,6 +901,10 @@ def run_controller_task(task_id, goal_id, vision, plan=None):
             cmd.extend(["-PlanFile", plan_path])
         if vision:
             cmd.append("-Vision")
+        if DASHBOARD_CONFIG.get("follow_drone_camera"):
+            cmd.append("-FollowDroneCamera")
+        if DASHBOARD_CONFIG.get("dual_camera_view"):
+            cmd.append("-DualCameraView")
         task["cmd"] = (
             "run_semantic_city.ps1 %s%s" % (
                 ("-PlanFile %s" % task.get("plan_path"))
@@ -770,6 +1005,27 @@ def run_controller_task(task_id, goal_id, vision, plan=None):
             if not task.get("error"):
                 task["error"] = "任务异常结束"
         task["finished_wall"] = time.time()
+        explanation_id = task.get("explanation_id")
+        if explanation_id:
+            try:
+                explainability_store.attach_execution(
+                    explanation_id,
+                    task_id,
+                    task.get("status"),
+                    outcome=task.get("outcome"),
+                    error=task.get("error"),
+                    returncode=task.get("returncode"),
+                    report_path=task.get("report_path"),
+                    report_sha256=(
+                        file_sha256(task["report_path"])
+                        if task.get("report_path")
+                        and os.path.isfile(task["report_path"]) else None),
+                    mission_result=task.get("result_json"),
+                    started_wall=task.get("started_wall"),
+                    finished_wall=task.get("finished_wall"),
+                )
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                _append_task_log(task, "[解释记录] 最终结果写入失败：%s" % exc)
         _record_task_history(task)
         _clear_current()
         try:
@@ -897,10 +1153,14 @@ def validate_plan(raw_steps):
             goal_id = str(raw.get("goal_id", "")).strip()
             if goal_id not in GOAL_WHITELIST:
                 raise ValueError("第 %d 步目标无效" % (index + 1))
+            fly_through = bool(raw.get("fly_through", False))
+            if fly_through and bool(raw.get("vision", False)):
+                raise ValueError("连续通过航点不能同时要求视觉悬停确认")
             normalized.append({
                 "action": "fly_to",
                 "goal_id": goal_id,
                 "vision": bool(raw.get("vision", False)),
+                "fly_through": fly_through,
             })
         elif action == "hover":
             try:
@@ -1105,7 +1365,7 @@ def review_plan_with_deepseek(local_review):
         return None, "DeepSeek 飞前审查返回格式无效"
 
 
-def execute_plan(raw_steps):
+def execute_plan(raw_steps, explanation_id=None):
     try:
         plan = validate_plan(raw_steps)
         review = build_plan_review(plan)
@@ -1116,6 +1376,39 @@ def execute_plan(raw_steps):
             "error": "飞前审查阻止执行：" + review["block_reason"],
             "review": review,
         }
+    fingerprint = _plan_fingerprint(plan)
+    with trajectory_preview_lock:
+        generated_fingerprint = trajectory_preview_state.get("fingerprint")
+    if generated_fingerprint != fingerprint:
+        return {
+            "error": "请先点击“生成 UE5 轨迹”，确认场景中出现航线后再执行",
+            "requires_trajectory_preview": True,
+        }
+    if not explanation_id:
+        record = _create_explanation(
+            "控制台任务队列", False, "operator", None, plan,
+            source="operator_plan")
+        explanation_id = record["explanation_id"]
+        explainability_store.attach_review(explanation_id, review)
+        explainability_store.attach_trajectory(explanation_id, {
+            "plan_fingerprint": fingerprint,
+            "preview_path": UNREAL_ROUTE_PREVIEW_PATH,
+            "preview_sha256": (
+                file_sha256(UNREAL_ROUTE_PREVIEW_PATH)
+                if os.path.isfile(UNREAL_ROUTE_PREVIEW_PATH) else None),
+            "route_point_count": trajectory_preview_state.get(
+                "route_point_count", 0),
+        })
+    try:
+        explanation_record = explainability_store.read(explanation_id)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {"error": "解释记录不存在，请重新生成 UE5 轨迹"}
+    if (
+        explanation_record.get("plan_sha256") != canonical_sha256(plan)
+        or (explanation_record.get("trajectory") or {}).get(
+            "plan_fingerprint") != fingerprint
+    ):
+        return {"error": "解释记录与当前计划不一致，请重新生成 UE5 轨迹"}
     with tasks_lock:
         active = any(
             task.get("status") in {"queued", "running"}
@@ -1149,7 +1442,10 @@ def execute_plan(raw_steps):
             "proc": None,
             "stop_requested": False,
             "history_written": False,
+            "explanation_id": explanation_id,
         }
+    explainability_store.attach_execution(
+        explanation_id, tid, "queued", outcome=None, error=None)
     worker = threading.Thread(
         target=run_controller_task,
         args=(tid, final_goal, vision, plan),
@@ -1160,6 +1456,8 @@ def execute_plan(raw_steps):
         "status": "queued",
         "vision": vision,
         "plan": plan,
+        "explanation_id": explanation_id,
+        "explainability": _read_explanation_summary(explanation_id),
     }
 
 
@@ -1193,6 +1491,7 @@ def _record_task_history(task):
         "ts": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(task.get("finished_wall") or time.time())),
         "cmd": task.get("cmd"),
         "plan": task.get("plan"),
+        "explanation_id": task.get("explanation_id"),
     })
 
 
@@ -1241,7 +1540,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>SZTU 无人机任务仪表盘</title>
+<title>__DASHBOARD_TITLE__</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box;font-family:'Segoe UI',system-ui,sans-serif}
 body{background:#f0f2f5;color:#333;overflow:hidden;height:100vh}
@@ -1274,6 +1573,13 @@ body{background:#f0f2f5;color:#333;overflow:hidden;height:100vh}
 .quick-cmd:hover{background:#e6f7ff;border-color:#1890ff}
 .vision-toggle{display:flex;align-items:center;gap:6px;padding:6px 10px;font-size:12px;color:#666;border-top:1px solid #e8e8e8}
 .plan-builder{margin:0 10px 8px;padding:8px;border:1px solid #d9e8f5;border-radius:7px;background:#f8fbff;font-size:12px}
+.semantic-command{margin:8px 10px;padding:9px;border:1px solid #91caff;border-radius:7px;background:#e6f4ff}
+.semantic-command-title{font-weight:600;color:#0958d9;margin-bottom:6px}
+.semantic-command-row{display:grid;grid-template-columns:1fr auto;gap:6px}
+.semantic-command select{min-width:0;padding:7px 8px;border:1px solid #91caff;border-radius:4px;background:#fff;font-size:12px}
+.semantic-command button{padding:7px 11px;border:0;border-radius:4px;background:#722ed1;color:#fff;cursor:pointer;font-size:12px}
+.semantic-command button:disabled{background:#bfbfbf;cursor:not-allowed}
+.trajectory-state{margin-top:6px;color:#531dab;line-height:1.4}
 .plan-title{display:flex;justify-content:space-between;align-items:center;font-weight:600;margin-bottom:6px}
 .plan-list{max-height:112px;overflow-y:auto}
 .plan-empty{color:#999;padding:8px;text-align:center}
@@ -1289,6 +1595,8 @@ body{background:#f0f2f5;color:#333;overflow:hidden;height:100vh}
 .plan-review{display:none;margin-top:6px;padding:7px;border-radius:5px;background:#f6ffed;border:1px solid #b7eb8f;color:#37651f;white-space:pre-wrap;max-height:110px;overflow-y:auto;line-height:1.45}
 .plan-review.risk-medium{background:#fffbe6;border-color:#ffe58f;color:#8a5a00}
 .plan-review.risk-high{background:#fff2f0;border-color:#ffccc7;color:#a61d24}
+.explainability-card{display:none;margin-top:6px;padding:7px;border-radius:5px;background:#f0f5ff;border:1px solid #adc6ff;color:#10239e;font-size:11px;line-height:1.45;white-space:pre-wrap}
+.explainability-card a{color:#1677ff;text-decoration:underline;cursor:pointer}
 .task-status{flex:0 0 270px;margin:4px 10px 8px;padding:8px 10px;background:#fafafa;border:1px solid #d9e8f5;border-radius:6px;font-size:12px;font-family:'Consolas',monospace;white-space:pre-wrap;word-break:break-word;max-height:270px;overflow:hidden}
 .task-log-head{display:flex;align-items:center;justify-content:space-between;margin-top:5px;font-family:'Segoe UI',system-ui,sans-serif;font-weight:600}
 .task-log-head button{padding:2px 8px;border:1px solid #91caff;background:#e6f4ff;color:#1677ff;border-radius:4px;cursor:pointer;font-size:11px}
@@ -1337,6 +1645,25 @@ body{background:#f0f2f5;color:#333;overflow:hidden;height:100vh}
   #status-panel .panel-body{max-height:520px}
   .onboard-preview{width:min(calc(100% - 24px),420px);align-self:center}
 }
+body.recording-layout{height:100vh;overflow:hidden;background:#111827}
+body.recording-layout .dashboard{grid-template-columns:235px 1fr!important;grid-template-rows:170px 1fr!important;height:100vh!important;min-height:0!important;padding:6px;gap:6px}
+body.recording-layout .panel{min-height:0!important;height:auto}
+body.recording-layout #ai-panel{display:block;grid-column:1/-1;grid-row:1;overflow:hidden}
+body.recording-layout #status-panel{grid-column:1;grid-row:2}
+body.recording-layout #map-panel{grid-column:2;grid-row:2}
+body.recording-layout #ai-panel .ai-config,
+body.recording-layout #ai-panel .quick-cmds,
+body.recording-layout #ai-panel .vision-toggle,
+body.recording-layout #ai-panel .plan-builder,
+body.recording-layout #ai-panel .chat-log,
+body.recording-layout #ai-panel .task-status,
+body.recording-layout #ai-panel .chat-input{display:none!important}
+body.recording-layout #ai-panel .semantic-command{display:block;margin:7px 10px;padding:8px}
+body.recording-layout #ai-panel .semantic-command-row{grid-template-columns:minmax(260px,1fr) auto}
+body.recording-layout #ai-panel .trajectory-state{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+body.recording-layout #status-panel .panel-body{max-height:none;overflow:hidden;padding:8px}
+body.recording-layout .status-item{padding:4px 0;font-size:12px}
+body.recording-layout .onboard-preview{width:calc(100% - 16px);margin:6px 8px 8px}
 </style>
 </head>
 <body>
@@ -1372,7 +1699,7 @@ body{background:#f0f2f5;color:#333;overflow:hidden;height:100vh}
 
   <!-- Panel 2: Semantic Map -->
   <div class="panel" id="map-panel">
-    <div class="panel-header">语义地图（局部坐标，Y+ 向上）</div>
+    <div class="panel-header">语义地图（PX4 局部 NED，北向↑ / 东向→）</div>
     <div class="panel-body">
       <canvas id="map-canvas"></canvas>
     </div>
@@ -1388,10 +1715,8 @@ body{background:#f0f2f5;color:#333;overflow:hidden;height:100vh}
       <span class="ai-config-status" id="ai-config-status"></span>
     </div>
     <div class="quick-cmds">
-      <span class="quick-cmd" onclick="addPlanStep('fly_to','delivery_zone')">＋投递区</span>
-      <span class="quick-cmd" onclick="addPlanStep('fly_to','inspection_gate')">＋巡检门</span>
-      <span class="quick-cmd" onclick="addPlanStep('fly_to','medical_station')">＋医疗站</span>
-      <span class="quick-cmd" onclick="addPlanStep('fly_to','start_pad')">＋返回起点</span>
+      <span class="quick-cmd" id="default-plan-btn" onclick="loadDefaultPlan()" style="display:none">＋完整巡检</span>
+      <span id="quick-goals" style="display:contents"></span>
       <span class="quick-cmd" onclick="addPlanStep('hover')">＋悬停</span>
       <span class="quick-cmd" onclick="addPlanStep('land')">＋降落</span>
       <span class="quick-cmd" onclick="sendCmd('状态')">查看状态</span>
@@ -1400,16 +1725,25 @@ body{background:#f0f2f5;color:#333;overflow:hidden;height:100vh}
       <input type="checkbox" id="vision-mode">
       <label for="vision-mode">启用机载相机视觉确认</label>
     </div>
+    <div class="semantic-command" id="semantic-command-panel">
+      <div class="semantic-command-title">① 选择语义指令</div>
+      <div class="semantic-command-row">
+        <select id="semantic-command-select" onchange="loadSelectedSemanticCommand()"></select>
+        <button id="generate-trajectory-btn" onclick="generateTrajectory()">② 生成 UE5 轨迹</button>
+      </div>
+      <div class="trajectory-state" id="trajectory-state">请选择指令并生成轨迹；轨迹出现前无人机不会起飞。</div>
+    </div>
     <div class="plan-builder" id="plan-builder">
       <div class="plan-title"><span>任务队列（点击按钮添加，可排序）</span><span id="plan-count">0 步</span></div>
       <div class="plan-list" id="plan-list"><div class="plan-empty">尚未添加任务步骤</div></div>
       <div class="plan-controls">
         <button onclick="clearPlan()">清空</button>
-        <button onclick="confirmPlan()">确认顺序</button>
-        <button class="primary" id="execute-plan-btn" onclick="executePlan()" disabled>开始执行</button>
+        <button onclick="confirmPlan()">仅做安全审查</button>
+        <button class="primary" id="execute-plan-btn" onclick="executePlan()" disabled>③ 沿轨迹执行</button>
       </div>
       <div class="plan-confirmed" id="plan-confirmed"></div>
       <div class="plan-review" id="plan-review"></div>
+      <div class="explainability-card" id="explainability-card"></div>
     </div>
     <div class="chat-log" id="chat-log">
       <div class="chat-msg ai">无人机任务仪表盘已就绪。请输入指令，或点击上方快捷操作。</div>
@@ -1442,6 +1776,9 @@ body{background:#f0f2f5;color:#333;overflow:hidden;height:100vh}
 </div>
 
 <script>
+if(new URLSearchParams(window.location.search).get('recording')==='1'||window.location.hash.includes('recording=1')){
+  document.body.classList.add('recording-layout');
+}
 let mapData = null;
 let trail = [];
 let currentTaskId = null;
@@ -1451,9 +1788,18 @@ let latestTaskLog = '';
 let reviewToken = 0;
 let planSteps = [];
 let planConfirmed = false;
+let trajectoryGenerated = false;
+let explanationId = null;
+let semanticProfiles = [];
 let onboardPreviewLive = false;
 const reportedIds = new Set();
-const PLAN_GOAL_NAMES={start_pad:'A 起点',inspection_gate:'巡检门',delivery_zone:'B 投递区',medical_station:'医疗站'};
+let PLAN_GOAL_NAMES={start_pad:'A 起点',inspection_gate:'巡检门',delivery_zone:'B 投递区',medical_station:'医疗站'};
+
+function loadDefaultPlan(){
+  if(isRunning||!mapData||!Array.isArray(mapData.default_plan))return;
+  planSteps=mapData.default_plan.map(step=>({...step}));
+  invalidatePlan();renderPlan();
+}
 
 function markConn(ok){
   const banner=document.getElementById('conn-banner');
@@ -1468,6 +1814,7 @@ function setRunningUI(running){
   const stopBtn=document.getElementById('stop-btn');if(stopBtn)stopBtn.disabled=!running;
   const qc=document.querySelector('.quick-cmds');if(qc){qc.style.pointerEvents=running?'none':'auto';qc.style.opacity=running?'0.6':'1';}
   const pb=document.getElementById('plan-builder');if(pb){pb.style.pointerEvents=running?'none':'auto';pb.style.opacity=running?'0.6':'1';}
+  const gb=document.getElementById('generate-trajectory-btn');if(gb)gb.disabled=running;
 }
 
 function planStepLabel(step){
@@ -1480,10 +1827,53 @@ function planStepLabel(step){
 function invalidatePlan(){
   reviewToken++;
   planConfirmed=false;
+  trajectoryGenerated=false;
+  explanationId=null;
   document.getElementById('execute-plan-btn').disabled=true;
   document.getElementById('plan-confirmed').textContent='';
   const review=document.getElementById('plan-review');
   review.style.display='none';review.textContent='';
+  const state=document.getElementById('trajectory-state');
+  if(state)state.textContent='任务队列已改变，请重新生成 UE5 轨迹。';
+}
+
+function loadSelectedSemanticCommand(){
+  if(isRunning)return;
+  const select=document.getElementById('semantic-command-select');
+  const profile=semanticProfiles.find(p=>p.id===select.value);
+  if(!profile)return;
+  planSteps=(profile.plan||[]).map(step=>({...step}));
+  invalidatePlan();renderPlan();
+  addChat('system',`已选择语义指令：${profile.label}。下一步请生成 UE5 轨迹。`);
+}
+
+function generateTrajectory(){
+  if(isRunning||!planSteps.some(s=>s.action==='fly_to')){
+    addChat('system','请先选择包含飞行目标的语义指令。');return;
+  }
+  if(!planSteps.some(s=>s.action==='land'))planSteps.push({action:'land'});
+  renderPlan();
+  const button=document.getElementById('generate-trajectory-btn');
+  const state=document.getElementById('trajectory-state');
+  button.disabled=true;state.textContent='正在规划并发送轨迹到 UE5……';
+  const body='plan='+encodeURIComponent(JSON.stringify({steps:planSteps}))+
+    '&explanation_id='+encodeURIComponent(explanationId||'');
+  fetch('/api/generate-trajectory',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body})
+    .then(async r=>({ok:r.ok,data:await r.json()})).then(({ok,data:d})=>{
+      button.disabled=false;
+      if(!ok||d.error){trajectoryGenerated=false;planConfirmed=false;state.textContent='轨迹生成失败：'+(d.error||'未知错误');return;}
+      trajectoryGenerated=true;planConfirmed=true;
+      explanationId=d.explanation_id||explanationId;
+      renderExplainability(d.explainability);
+      renderPlanReview(d.review);
+      document.getElementById('execute-plan-btn').disabled=false;
+      document.getElementById('plan-confirmed').textContent='轨迹已锁定：\n'+planSteps.map((s,i)=>`${i+1}. ${planStepLabel(s)}`).join('\n');
+      state.textContent=`UE5 轨迹已生成（${d.route_point_count} 个轨迹点）。请先观察场景中的紫青色航线，再点击“沿轨迹执行”。`;
+      addChat('system',`UE5 轨迹已生成，共 ${d.route_point_count} 个轨迹点；无人机仍保持停止。`);
+    }).catch(()=>{
+      button.disabled=false;trajectoryGenerated=false;planConfirmed=false;
+      state.textContent='轨迹生成请求失败，请检查 8082 服务。';markConn(false);
+    });
 }
 
 function addPlanStep(action,goal){
@@ -1567,6 +1957,45 @@ function renderPlanReview(review){
   el.style.display='block';
 }
 
+function renderExplainability(info){
+  if(!info)return;
+  explanationId=info.explanation_id||explanationId;
+  const el=document.getElementById('explainability-card');
+  const short=v=>v?String(v).slice(0,12):'-';
+  const lines=[
+    `解释链：${info.status||'-'}｜解析 ${info.parser||'-'}${info.model?' / '+info.model:''}`,
+    `地图 ${info.map_id||'-'} @ ${short(info.map_sha256)}｜计划 ${short(info.plan_sha256)}`,
+    `风险 ${info.risk||'-'}｜航程 ${info.route_distance_m??'-'} m｜轨迹点 ${info.route_point_count??'-'}`,
+  ];
+  if(info.task_id)lines.push(`任务 ${info.task_id}｜结果 ${info.outcome||'执行中'}`);
+  el.textContent=lines.join('\n')+'\n';
+  const link=document.createElement('a');
+  link.textContent='查看完整解释记录 JSON';
+  link.onclick=()=>window.open('/api/explainability/'+encodeURIComponent(explanationId),'_blank');
+  el.appendChild(link);el.style.display='block';
+}
+
+function refreshExplainability(id){
+  if(!id)return;
+  fetch('/api/explainability/'+encodeURIComponent(id))
+    .then(r=>r.ok?r.json():null).then(record=>{
+      if(!record)return;
+      renderExplainability({
+        explanation_id:record.explanation_id,status:record.status,
+        parser:record.parser&&record.parser.name,
+        model:record.parser&&record.parser.model,
+        map_id:record.semantic_map&&record.semantic_map.map_id,
+        map_sha256:record.semantic_map&&record.semantic_map.sha256,
+        plan_sha256:record.plan_sha256,
+        risk:record.safety_review&&record.safety_review.risk,
+        route_distance_m:record.safety_review&&record.safety_review.route_distance_m,
+        route_point_count:record.trajectory&&record.trajectory.route_point_count,
+        task_id:record.execution&&record.execution.task_id,
+        outcome:record.execution&&record.execution.outcome,
+      });
+    });
+}
+
 function confirmPlan(){
   if(!planSteps.some(s=>s.action==='fly_to')){
     addChat('system','任务队列至少需要一个飞行目标。');return;
@@ -1580,7 +2009,8 @@ function confirmPlan(){
   document.getElementById('execute-plan-btn').disabled=true;
   document.getElementById('plan-confirmed').textContent='正在进行飞前安全审查……';
   const token=++reviewToken;
-  const body='plan='+encodeURIComponent(JSON.stringify({steps:planSteps}));
+  const body='plan='+encodeURIComponent(JSON.stringify({steps:planSteps}))+
+    '&explanation_id='+encodeURIComponent(explanationId||'');
   fetch('/api/review-plan',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body})
     .then(async r=>({ok:r.ok,data:await r.json()})).then(({ok,data:d})=>{
       if(token!==reviewToken)return;
@@ -1589,6 +2019,7 @@ function confirmPlan(){
         return;
       }
       renderPlanReview(d);
+      renderExplainability(d.explainability);
       if(d.blocked){
         planConfirmed=false;
         document.getElementById('execute-plan-btn').disabled=true;
@@ -1596,9 +2027,9 @@ function confirmPlan(){
         addChat('system','飞前审查阻止执行：'+d.block_reason);
       }else{
         planConfirmed=true;
-        document.getElementById('execute-plan-btn').disabled=false;
+        document.getElementById('execute-plan-btn').disabled=!trajectoryGenerated;
         document.getElementById('plan-confirmed').textContent='已确认：\n'+planSteps.map((s,i)=>`${i+1}. ${planStepLabel(s)}`).join('\n');
-        addChat('system',`飞前审查完成：${d.risk}风险，约 ${d.route_distance_m} 米，预计 ${d.estimated_seconds} 秒。`);
+        addChat('system',`飞前审查完成：${d.risk}风险，约 ${d.route_distance_m} 米，预计 ${d.estimated_seconds} 秒。仍需生成 UE5 轨迹后才能执行。`);
       }
     }).catch(()=>{
       if(token!==reviewToken)return;
@@ -1608,12 +2039,17 @@ function confirmPlan(){
 }
 
 function executePlan(){
-  if(!planConfirmed||isRunning)return;
-  const body='plan='+encodeURIComponent(JSON.stringify({steps:planSteps}));
+  if(!planConfirmed||!trajectoryGenerated||isRunning){
+    addChat('system','请先生成并确认 UE5 轨迹，再执行飞行。');return;
+  }
+  const body='plan='+encodeURIComponent(JSON.stringify({steps:planSteps}))+
+    '&explanation_id='+encodeURIComponent(explanationId||'');
   addChat('system','正在提交已确认的同会话任务队列……');
   fetch('/api/execute-plan',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body})
     .then(async r=>({ok:r.ok,data:await r.json()})).then(({ok,data:d})=>{
       if(!ok||d.error){addChat('system',d.error||'任务队列提交失败');return;}
+      explanationId=d.explanation_id||explanationId;
+      renderExplainability(d.explainability);
       currentTaskId=d.task_id;setRunningUI(true);updateStepper(0,'running');
       document.getElementById('task-status').style.display='block';
       addChat('system',`任务 ${d.task_id} 已加入队列，共 ${d.plan.length} 步；将在同一 UE/PX4 会话中执行。`);
@@ -1632,7 +2068,39 @@ function updateStepper(stageIndex,status){
   });
 }
 
-fetch('/api/map').then(r=>r.json()).then(d=>{mapData=d;drawMap(null);});
+fetch('/api/map').then(r=>r.json()).then(d=>{
+  mapData=d;
+  PLAN_GOAL_NAMES={};
+  Object.entries(d.goals||{}).forEach(([id,g])=>{
+    PLAN_GOAL_NAMES[id]=g.display_label||g.label||id;
+  });
+  Object.assign(ZONE_NAMES,PLAN_GOAL_NAMES);
+  const goalBox=document.getElementById('quick-goals');
+  if(goalBox){
+    goalBox.replaceChildren();
+    Object.entries(d.goals||{}).forEach(([id,g])=>{
+      const button=document.createElement('span');
+      button.className='quick-cmd';
+      button.textContent='＋'+(g.display_label||g.label||id);
+      button.onclick=()=>addPlanStep('fly_to',id);
+      goalBox.appendChild(button);
+    });
+  }
+  const defaultButton=document.getElementById('default-plan-btn');
+  if(defaultButton&&Array.isArray(d.default_plan))defaultButton.style.display='inline-block';
+  semanticProfiles=Array.isArray(d.mission_profiles)&&d.mission_profiles.length
+    ? d.mission_profiles
+    : [{id:'default_inspection',label:'完整语义巡检',description:'按地图默认航线巡检',plan:d.default_plan||[]}];
+  const commandSelect=document.getElementById('semantic-command-select');
+  commandSelect.replaceChildren();
+  semanticProfiles.forEach(profile=>{
+    const option=document.createElement('option');
+    option.value=profile.id;option.textContent=profile.label;
+    commandSelect.appendChild(option);
+  });
+  if(semanticProfiles.length)loadSelectedSemanticCommand();
+  drawMap(null);
+});
 fetch('/api/ai-status').then(r=>r.json()).then(d=>{
   updateAiStatus(d);
 });
@@ -1679,6 +2147,20 @@ setInterval(()=>{
   if(currentTaskId){ pollTask(currentTaskId); }
 },200);
 
+function syncTrajectoryPreview(){
+  fetch('/api/trajectory-preview').then(r=>r.json()).then(d=>{
+    if(!d||!d.generated_wall||!Array.isArray(d.plan))return;
+    const samePlan=JSON.stringify(d.plan)===JSON.stringify(planSteps);
+    if(!samePlan)return;
+    trajectoryGenerated=true;planConfirmed=true;
+    const executeButton=document.getElementById('execute-plan-btn');
+    if(executeButton&&!isRunning)executeButton.disabled=false;
+    const state=document.getElementById('trajectory-state');
+    if(state)state.textContent=`UE5 轨迹已生成（${d.route_point_count||0} 个轨迹点）；等待执行或正在沿轨迹飞行。`;
+  }).catch(()=>{});
+}
+setInterval(syncTrajectoryPreview,1000);
+
 function refreshOnboardPreview(){
   if(refreshOnboardPreview.loading)return;
   refreshOnboardPreview.loading=true;
@@ -1713,23 +2195,27 @@ function mapLocalXY(x,y){
 // Display-only coordinate helpers. Never feed these values back to UE, PX4,
 // the route planner, mission commands, or recorded telemetry.
 function mapLocalToDisplayXY(x,y){
-  return [x||0,-(y||0)];
+  // PX4 local NED: X is North, Y is East. The dashboard is north-up like
+  // QGC, therefore screen/display X is East and display Y is North.
+  return [y||0,x||0];
 }
 
 function mapDisplayVectorXY(x,y){
-  return [x||0,-(y||0)];
+  return [y||0,x||0];
 }
 
 function mapDisplayYawDeg(yaw){
-  return -(yaw||0);
+  return yaw||0;
 }
 
 function mapDisplaySensorBearingDeg(yaw,bodyAngle){
-  return mapDisplayYawDeg((yaw||0)+(bodyAngle||0));
+  return (yaw||0)+(bodyAngle||0);
 }
 
 function mapDisplayAngleToCanvasRad(displayAngle){
-  return -(displayAngle||0)*Math.PI/180;
+  // Canvas vehicle glyph points to +screen-X at zero rotation; QGC/NED yaw
+  // zero points North (screen up), so subtract 90 degrees.
+  return ((displayAngle||0)-90)*Math.PI/180;
 }
 
 function mapDisplayXY(x,y){
@@ -1770,26 +2256,30 @@ function resizeCanvas(){
   canvas.width=r.width;canvas.height=r.height;
 }
 window.addEventListener('resize',resizeCanvas);resizeCanvas();
-const COLORS={start_pad:'#f5c518',inspection_gate:'#3b82f6',delivery_zone:'#22c55e',medical_station:'#ef4444'};
+const COLORS={start_pad:'#f5c518',inspection_gate:'#3b82f6',delivery_zone:'#22c55e',medical_station:'#ef4444',bridge_entry:'#22c55e',bridge_ascent:'#13c2c2',bridge_apex:'#ef4444',bridge_descent:'#fa8c16',bridge_exit:'#722ed1',far_pad:'#2f54eb'};
 const ZONE_NAMES={start_pad:'A 起点',inspection_gate:'巡检门',delivery_zone:'B 投递区',medical_station:'医疗站',transit:'航路区'};
 
 function drawMap(t){
   resizeCanvas();
   const w=canvas.width,h=canvas.height;
   ctx.clearRect(0,0,w,h);ctx.fillStyle='#fafafa';ctx.fillRect(0,0,w,h);
-  const xMin=-5,xMax=25,yMin=-8,yMax=8;
+  const points=[];
+  if(mapData&&mapData.goals)Object.values(mapData.goals).forEach(g=>points.push(mapLocalToDisplayXY(g.position_m[0],g.position_m[1])));
+  if(mapData&&mapData.inspection_zones)mapData.inspection_zones.forEach(z=>points.push(mapLocalToDisplayXY(z.position_m[0],z.position_m[1])));
+  const xs=points.map(p=>p[0]),ys=points.map(p=>p[1]);
+  const xMin=xs.length?Math.min(...xs)-4:-5,xMax=xs.length?Math.max(...xs)+4:25;
+  const yMin=ys.length?Math.min(...ys)-4:-8,yMax=ys.length?Math.max(...ys)+4:8;
   const scaleX=w/(xMax-xMin),scaleY=h/(yMax-yMin);
   const scale=Math.min(scaleX,scaleY)*0.9;
   const ox=w/2-(xMin+xMax)/2*scale;
   const oy=h/2+(yMin+yMax)/2*scale;
-  // UE/PX4 keep their internal NED coordinates. The UI presents
-  // displayY=-internalY so the physical UE layout stays unchanged while
-  // the user-facing map follows the conventional +Y-up convention.
-  function w2s(x,y){return [ox+x*scale,oy+y*scale];}
+  // UE/PX4 keep internal NED coordinates; w2s rotates them for a QGC-style
+  // north-up view without feeding display coordinates back into control.
+  function w2s(x,y){const [east,north]=mapLocalToDisplayXY(x,y);return [ox+east*scale,oy-north*scale];}
   function d2s(x,y){return [ox+x*scale,oy-y*scale];}
   ctx.strokeStyle='#e8e8e8';ctx.lineWidth=1;ctx.font='10px monospace';ctx.fillStyle='#bbb';
-  for(let gx=0;gx<=25;gx+=5){let [sx,_]=w2s(gx,0);ctx.beginPath();ctx.moveTo(sx,0);ctx.lineTo(sx,h);ctx.stroke();ctx.fillText(gx+'m',sx+2,h-12);}
-  for(let gy=-5;gy<=8;gy+=5){let [_,sy]=d2s(0,gy);ctx.beginPath();ctx.moveTo(0,sy);ctx.lineTo(w,sy);ctx.stroke();ctx.fillText(gy+'m',4,sy-2);}
+  for(let gx=Math.ceil(xMin/5)*5;gx<=xMax;gx+=5){let [sx,_]=w2s(gx,0);ctx.beginPath();ctx.moveTo(sx,0);ctx.lineTo(sx,h);ctx.stroke();ctx.fillText(gx+'m',sx+2,h-12);}
+  for(let gy=Math.ceil(yMin/5)*5;gy<=yMax;gy+=5){let [_,sy]=d2s(0,gy);ctx.beginPath();ctx.moveTo(0,sy);ctx.lineTo(w,sy);ctx.stroke();ctx.fillText(gy+'m',4,sy-2);}
   if(mapData&&mapData.obstacles){
     mapData.obstacles.forEach(ob=>{
       let [cx,cy]=ob.center_m,[sw,sh]=ob.size_m;
@@ -1797,6 +2287,40 @@ function drawMap(t){
       ctx.fillStyle='rgba(120,120,120,0.3)';ctx.strokeStyle='#999';ctx.lineWidth=1;
       ctx.fillRect(sx-sw*scale/2,sy-sh*scale/2,sw*scale,sh*scale);
       ctx.strokeRect(sx-sw*scale/2,sy-sh*scale/2,sw*scale,sh*scale);
+    });
+  }
+  if(mapData&&mapData.bridge){
+    const bridge=mapData.bridge;
+    const deckStart=Number(bridge.deck_start_m||0);
+    const deckEnd=Number(bridge.deck_end_m||bridge.deck_length_m||0);
+    const halfWidth=Number(bridge.deck_width_m||8)/2;
+    const bridgeCorners=[w2s(deckStart,-halfWidth),w2s(deckStart,halfWidth),w2s(deckEnd,-halfWidth),w2s(deckEnd,halfWidth)];
+    const bridgeXs=bridgeCorners.map(p=>p[0]),bridgeYs=bridgeCorners.map(p=>p[1]);
+    const left=Math.min(...bridgeXs),right=Math.max(...bridgeXs),top=Math.min(...bridgeYs),bottom=Math.max(...bridgeYs);
+    ctx.save();
+    ctx.fillStyle='rgba(71,85,105,0.13)';
+    ctx.strokeStyle='#334155';ctx.lineWidth=4;
+    ctx.fillRect(left,top,right-left,bottom-top);
+    ctx.strokeRect(left,top,right-left,bottom-top);
+    ctx.setLineDash([8,5]);ctx.strokeStyle='#94a3b8';ctx.lineWidth=1.5;
+    const [,spanTop]=w2s(deckStart+(deckEnd-deckStart-(bridge.structural_span_m||0))/2,0);
+    const [,spanBottom]=w2s(deckEnd-(deckEnd-deckStart-(bridge.structural_span_m||0))/2,0);
+    ctx.beginPath();ctx.moveTo(left,spanTop);ctx.lineTo(right,spanTop);ctx.moveTo(left,spanBottom);ctx.lineTo(right,spanBottom);ctx.stroke();
+    ctx.restore();
+    ctx.fillStyle='#334155';ctx.font='600 11px sans-serif';ctx.textAlign='center';
+    ctx.fillText(`桥面边界 ${Number(bridge.deck_length_m||deckEnd-deckStart).toFixed(0)}m · N↑ E→`,(left+right)/2,top+14);
+  }
+  if(mapData&&mapData.inspection_zones){
+    const zoneColors={road_crack:'#111827',pest:'#d97706',plant:'#16a34a',bird:'#7c3aed'};
+    mapData.inspection_zones.forEach(zone=>{
+      const [sx,sy]=w2s(zone.position_m[0],zone.position_m[1]);
+      const radius=(zone.radius_m||0.8)*scale;
+      ctx.save();ctx.setLineDash([4,3]);ctx.lineWidth=2;
+      ctx.strokeStyle=zoneColors[zone.class]||'#64748b';
+      ctx.fillStyle=(zoneColors[zone.class]||'#64748b')+'18';
+      ctx.beginPath();ctx.arc(sx,sy,radius,0,Math.PI*2);ctx.fill();ctx.stroke();ctx.restore();
+      ctx.fillStyle=zoneColors[zone.class]||'#64748b';ctx.font='10px sans-serif';ctx.textAlign='center';
+      ctx.fillText(zone.label||zone.class,sx,sy-radius-4);
     });
   }
   if(trail.length>1){
@@ -1848,8 +2372,8 @@ function drawMap(t){
     ctx.fillText(`V=${fmt(Math.hypot(t.velocity_x_mps||0,t.velocity_y_mps||0,t.velocity_z_mps||0),1)}m/s`,dx+14,dy+8);
   }
   ctx.fillStyle='#8c8c8c';ctx.font='11px sans-serif';
-  ctx.textAlign='left';ctx.fillText('Y+ ↑',12,18);
-  ctx.textAlign='right';ctx.fillText('X+ →',w-12,h-12);
+  ctx.textAlign='left';ctx.fillText('北（X+）↑',12,18);
+  ctx.textAlign='right';ctx.fillText('东（Y+）→',w-12,h-12);
 }
 
 function sendCmd(text){
@@ -1867,6 +2391,8 @@ function sendCmd(text){
       log.removeChild(log.lastChild);
       addChat('ai',d.reply);
       addChat('system',d.parser==='deepseek'?'由 DeepSeek AI 理解':'由本地规则理解');
+      explanationId=d.explanation_id||null;
+      renderExplainability(d.explainability);
       if(Array.isArray(d.plan)&&d.plan.length){
         const replaced=planSteps.length>0;
         planSteps=d.plan.map(step=>({...step}));
@@ -1942,6 +2468,12 @@ function pollTask(id){
       rep.style.display='block';
       repLink.onclick=()=>window.open('/api/task/'+id+'/report','_blank');
     } else { rep.style.display='none'; }
+    if(d.explanation_id){
+      explanationId=d.explanation_id;
+      if(d.status==='done'||d.status==='stopped'||d.status==='error'){
+        refreshExplainability(d.explanation_id);
+      }
+    }
     if(d.status==='running'||d.status==='queued'||d.status==='stopping'){
       setRunningUI(true);
     } else {
@@ -1997,9 +2529,10 @@ function loadHistory(){
       const oc=h.outcome||'-';
       const cls=oc==='PASS'?'badge-pass':(oc==='STOPPED'?'badge-stop':'badge-check');
       const rp=h.report_path?'<span class="report-link" onclick="window.open(\'/api/task/'+h.task_id+'/report\',\'_blank\')">报告</span>':'';
+      const xp=h.explanation_id?'<span class="report-link" onclick="window.open(\'/api/explainability/'+h.explanation_id+'\',\'_blank\')">解释链</span>':'';
       const goal=(h.goal_id||(h.action||''));
       const t=h.finished?new Date(h.finished*1000).toLocaleString('zh-CN'):'';
-      return '<div class="history-item"><span class="h-id">'+h.task_id+'</span> <span class="'+cls+'">'+oc+'</span> ｜ 目标:'+goal+' ｜ 视觉:'+(h.vision?'是':'否')+' ｜ '+t+' '+rp+'</div>';
+      return '<div class="history-item"><span class="h-id">'+h.task_id+'</span> <span class="'+cls+'">'+oc+'</span> ｜ 目标:'+goal+' ｜ 视觉:'+(h.vision?'是':'否')+' ｜ '+t+' '+rp+' '+xp+'</div>';
     }).join('');
   }).catch(()=>{markConn(false);});
 }
@@ -2047,8 +2580,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _local_origin_allowed(self):
         origin = self.headers.get("Origin", "")
         return (not origin) or origin in {
-            "http://127.0.0.1:8080",
-            "http://localhost:8080",
+            "http://127.0.0.1:%d" % SERVER_PORT,
+            "http://localhost:%d" % SERVER_PORT,
+            "http://[::1]:%d" % SERVER_PORT,
         }
 
     def _send_json(self, obj, code=200):
@@ -2063,7 +2597,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if self.path == "/":
             dashboard_html = DASHBOARD_HTML.replace(
                 "__CAMERA_PREVIEW_POLL_MS__",
-                str(CAMERA_PREVIEW_POLL_MS))
+                str(CAMERA_PREVIEW_POLL_MS)).replace(
+                    "__DASHBOARD_TITLE__",
+                    str(DASHBOARD_CONFIG.get("title", "IFSC 无人机巡检任务仪表盘")))
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
@@ -2151,6 +2687,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_json(_load_history()[::-1])
         elif self.path == "/api/current":
             self._send_json({"task_id": _read_current()})
+        elif self.path == "/api/trajectory-preview":
+            with trajectory_preview_lock:
+                preview = dict(trajectory_preview_state)
+            preview["exists"] = os.path.isfile(UNREAL_ROUTE_PREVIEW_PATH)
+            self._send_json(preview)
+        elif self.path.startswith("/api/explainability/"):
+            explanation_id = self.path.rsplit("/", 1)[-1]
+            try:
+                self._send_json(explainability_store.read(explanation_id))
+            except (OSError, ValueError, json.JSONDecodeError):
+                self._send_json({"error": "解释记录不存在"}, 404)
         elif self.path.startswith("/api/task/"):
             if self.path.endswith("/report"):
                 tid = self.path[len("/api/task/"):-len("/report")]
@@ -2193,7 +2740,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
         elif self.path == "/api/command":
             text = params.get("text", [""])[0]
             requested_vision = params.get("vision", ["0"])[0] == "1"
-            local_plan = parse_plan_local(text)
+            wants_default_plan = bool(
+                MAP_DATA.get("default_plan")
+                and re.search(r"完整巡检|全桥巡检|飞越(?:整座|全)?桥|从.*桥头.*对岸", text))
+            local_plan = (
+                [dict(step) for step in MAP_DATA["default_plan"]]
+                if wants_default_plan else parse_plan_local(text))
             if local_plan is not None:
                 ai_plan, ai_error = parse_plan_with_deepseek(text)
                 if ai_plan is not None:
@@ -2210,6 +2762,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     for step in plan:
                         if step["action"] == "fly_to":
                             step["vision"] = True
+                explanation = _create_explanation(
+                    text, requested_vision, parser_name,
+                    ai_error if parser_name == "rules" else None,
+                    validate_plan(plan))
                 self._send_json({
                     "action": "sequence",
                     "goal_id": None,
@@ -2222,6 +2778,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "parser": parser_name,
                     "ai_fallback_reason": (
                         ai_error if parser_name == "rules" else None),
+                    "explanation_id": explanation["explanation_id"],
+                    "explainability": public_summary(explanation),
                     "error": None,
                 })
                 return
@@ -2243,6 +2801,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
             vision = requested_vision or parsed_vision
             if vision and not parsed_vision and action == "fly_to":
                 reply += "（视觉确认模式）"
+            explanation = None
+            if action == "fly_to" and goal_id:
+                explanation = _create_explanation(
+                    text, requested_vision, parser_name,
+                    ai_error if parser_name == "rules" else None,
+                    validate_plan([{
+                        "action": "fly_to", "goal_id": goal_id,
+                        "vision": vision,
+                    }]))
             result = ""
             if action == "status":
                 res = execute_command(action, goal_id, vision)
@@ -2252,6 +2819,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "reply": reply, "result": result,
                 "parser": parser_name,
                 "ai_fallback_reason": ai_error if parser_name == "rules" else None,
+                "explanation_id": (
+                    explanation["explanation_id"] if explanation else None),
+                "explainability": (
+                    public_summary(explanation) if explanation else None),
                 "error": None if action == "status" else None,
             })
         elif self.path.startswith("/api/task/") and self.path.endswith("/stop"):
@@ -2281,6 +2852,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": "拒绝非本机页面的任务请求"}, 403)
                 return
             raw_plan = params.get("plan", [""])[0]
+            explanation_id = params.get("explanation_id", [""])[0] or None
             try:
                 payload = json.loads(raw_plan)
                 steps = payload.get("steps") if isinstance(payload, dict) else payload
@@ -2292,19 +2864,43 @@ class DashboardHandler(BaseHTTPRequestHandler):
             review["ai"] = ai_review
             review["reviewer"] = "deepseek" if ai_review else "local"
             review["ai_fallback_reason"] = ai_error if not ai_review else None
+            if explanation_id:
+                try:
+                    record = explainability_store.attach_review(
+                        explanation_id, review)
+                    review["explanation_id"] = explanation_id
+                    review["explainability"] = public_summary(record)
+                except (OSError, ValueError, json.JSONDecodeError) as exc:
+                    self._send_json({"error": str(exc)}, 400)
+                    return
             self._send_json(review)
+        elif self.path == "/api/generate-trajectory":
+            if not self._local_origin_allowed():
+                self._send_json({"error": "拒绝非本机页面的轨迹生成请求"}, 403)
+                return
+            raw_plan = params.get("plan", [""])[0]
+            explanation_id = params.get("explanation_id", [""])[0] or None
+            try:
+                payload = json.loads(raw_plan)
+                steps = payload.get("steps") if isinstance(payload, dict) else payload
+                result = generate_trajectory_preview(steps, explanation_id)
+            except (TypeError, ValueError, json.JSONDecodeError, OSError) as exc:
+                self._send_json({"error": str(exc)}, 400)
+                return
+            self._send_json(result)
         elif self.path == "/api/execute-plan":
             if not self._local_origin_allowed():
                 self._send_json({"error": "拒绝非本机页面的任务请求"}, 403)
                 return
             raw_plan = params.get("plan", [""])[0]
+            explanation_id = params.get("explanation_id", [""])[0] or None
             try:
                 payload = json.loads(raw_plan)
                 steps = payload.get("steps") if isinstance(payload, dict) else payload
             except Exception:
                 self._send_json({"error": "任务队列 JSON 无效"}, 400)
                 return
-            res = execute_plan(steps)
+            res = execute_plan(steps, explanation_id)
             if "error" in res:
                 self._send_json(res, 400)
             else:
@@ -2371,18 +2967,25 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 
 def main():
-    global DEFAULT_MAP, DEFAULT_UE_MAP, GOAL_WHITELIST
+    global DEFAULT_MAP, DEFAULT_UE_MAP, GOAL_WHITELIST, SERVER_PORT
     import argparse
-    parser = argparse.ArgumentParser(description="SZTU Drone Dashboard")
+    parser = argparse.ArgumentParser(description="IFSC Bridge Inspection Dashboard")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--telemetry-port", type=int, default=DEFAULT_TELEMETRY_PORT)
     parser.add_argument("--map", type=str, default=DEFAULT_MAP)
     parser.add_argument("--ue-map", type=str, default="",
                         help="optional override; defaults to semantic JSON ue_map")
     args = parser.parse_args()
+    SERVER_PORT = args.port
 
     DEFAULT_MAP = os.path.abspath(args.map)
     GOAL_WHITELIST, map_ue_map = load_map_dispatch_config(DEFAULT_MAP)
+    try:
+        with open(DEFAULT_MAP, "r", encoding="utf-8") as map_file:
+            _refresh_map_runtime_config(json.load(map_file))
+    except (OSError, ValueError) as exc:
+        parser.error("invalid semantic map JSON: %s" % exc)
     DEFAULT_UE_MAP = args.ue_map or map_ue_map
     if (not re.fullmatch(r"/Game/[A-Za-z0-9_./-]+", DEFAULT_UE_MAP)
             or ".." in DEFAULT_UE_MAP):
@@ -2396,8 +2999,16 @@ def main():
     print(f"[dashboard] UE map: {DEFAULT_UE_MAP}")
 
     # ThreadingHTTPServer so a long controller run never blocks telemetry polling.
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), DashboardHandler)
-    print(f"[dashboard] open http://localhost:{args.port} in your browser")
+    if ":" in args.host:
+        class IPv6ThreadingHTTPServer(ThreadingHTTPServer):
+            address_family = socket.AF_INET6
+        server_class = IPv6ThreadingHTTPServer
+        display_host = "[%s]" % args.host
+    else:
+        server_class = ThreadingHTTPServer
+        display_host = args.host
+    server = server_class((args.host, args.port), DashboardHandler)
+    print(f"[dashboard] open http://{display_host}:{args.port} in your browser")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

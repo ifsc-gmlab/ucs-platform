@@ -13,7 +13,7 @@ class USceneCaptureComponent2D;
 class UTextureRenderTarget2D;
 class UStaticMeshComponent;
 class AStaticMeshActor;
-class USZTUMavlinkSITLComponent;
+class USZTUFlightControllerComponent;
 
 UENUM(BlueprintType)
 enum class ESZTUMultirotorAirframe : uint8
@@ -54,6 +54,8 @@ public:
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components")
     USceneCaptureComponent2D* VisionCapture;
 
+    UTextureRenderTarget2D* GetCaptureRenderTarget() const { return CaptureRenderTarget; }
+
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components")
     TArray<UStaticMeshComponent*> RotorDiscs;
 
@@ -61,7 +63,10 @@ public:
     USZTUEnvelopeMonitorComponent* EnvelopeMonitor;
 
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components")
-    USZTUMavlinkSITLComponent* SITLComponent = nullptr;
+    // Kept under the historical SITLComponent property name for asset
+    // compatibility; the type is backend-neutral so the controller can be
+    // replaced without rewriting vehicle or environment logic.
+    USZTUFlightControllerComponent* SITLComponent = nullptr;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SITL Physics")
     ESZTUMultirotorAirframe Airframe = ESZTUMultirotorAirframe::QuadX;
@@ -188,6 +193,8 @@ private:
     // This replaces the original zero-delay linear thrust that caused
     // the ~0.45 Hz limit-cycle oscillation.
     float ActualRPM[8] = {};
+    bool bTouchdownLatched = true;
+    float GroundReleaseTimerSec = 0.0f;
     static constexpr float MaxRPM = 9500.0f;        // AirSim F450 rotor_params.max_rpm
     static constexpr float MotorTau = 0.02f;         // 20ms ESC+motor response (reduced from 50ms for EKF stability)
     static constexpr float LinearDragCoeff = 4.0f;   // body linear drag (AirSim F450: default * 4)
@@ -223,6 +230,7 @@ private:
     float VisionCaptureIntervalSec = 1.0f;   // 1 Hz; temporal voting does not need video rate
     int32 VisionCaptureFrameCount = 0;
     bool bVisionCaptureEnabled = false;
+    bool bArchiveVisionFrames = false;
     int32 VisionCaptureWidth = 320;           // Keep synchronous GPU readback lightweight
     int32 VisionCaptureHeight = 180;
 
@@ -248,6 +256,18 @@ private:
     // approaching. Only runs in the urban semantic scene. Markers are visual
     // only (NoCollision) and are not saved to the map.
     void SpawnSemanticLandmarks();
+
+    // Live semantic route preview. The dashboard writes one authoritative JSON
+    // file before flight; UE reloads it while running and renders the same
+    // waypoint sequence that the controller will execute.
+    void RefreshSemanticRoutePreview(float DeltaSeconds, bool bForce = false);
+    void DrawSemanticRoutePreview() const;
+    FString SemanticRoutePreviewPath;
+    FDateTime SemanticRoutePreviewTimestamp;
+    float SemanticRoutePreviewPollSeconds = 0.0f;
+    FVector SemanticRouteOriginWorld = FVector::ZeroVector;
+    TArray<FVector> SemanticRoutePointsWorld;
+    TArray<FString> SemanticRoutePointLabels;
 
     // Marker components attached to this pawn (guaranteed to render in SceneCapture).
     TArray<UStaticMeshComponent*> LandmarkMarkers;

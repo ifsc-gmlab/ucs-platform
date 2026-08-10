@@ -1,0 +1,68 @@
+﻿# Deployment Bundle Report
+
+- Generated: 2026-07-31 09:16:04 +08:00
+- Workspace: C:\Users\49337\OneDrive\Desktop\Desktop\实习\光明
+- UE project root: D:\SZTUWindFieldPX4Demo\Unreal
+- QGroundControl SHA256: 1031BDA2D3299547BA8711AB567C58638671AF1C1693AB1672D8341919C3840C
+- IFSC Station SHA256: DEFCBECCA18035AD2C6326E49500D81A3522E665EA56FE3D282DA19CC801FD21
+- Overall: PASS
+
+## Checks
+
+- [x] Deployment manual: `C:\Users\49337\OneDrive\Desktop\Desktop\实习\光明\DEPLOYMENT_MANUAL.md`
+- [x] Environment checker: `C:\Users\49337\OneDrive\Desktop\Desktop\实习\光明\outputs\check_px4_wsl_env.ps1`
+- [x] HIL verifier: `C:\Users\49337\OneDrive\Desktop\Desktop\实习\光明\outputs\verify_px4_ue_hil.ps1`
+- [x] QGC launcher: `C:\Users\49337\OneDrive\Desktop\Desktop\实习\光明\outputs\run_qgc_control.ps1`
+- [x] Wind QGC one-click entry: `C:\Users\49337\OneDrive\Desktop\Desktop\实习\光明\START_WIND_QGC_DEMO.cmd`
+- [x] Wind QGC demo launcher: `C:\Users\49337\OneDrive\Desktop\Desktop\实习\光明\outputs\start_wind_qgc_demo.ps1`
+- [x] UE/QGC window layout: `C:\Users\49337\OneDrive\Desktop\Desktop\实习\光明\outputs\prepare_wind_demo_layout.ps1`
+- [x] Circle-flight launcher: `C:\Users\49337\OneDrive\Desktop\Desktop\实习\光明\outputs\run_circle_flight.ps1`
+- [x] Headwind launcher: `C:\Users\49337\OneDrive\Desktop\Desktop\实习\光明\outputs\run_headwind_test.ps1`
+- [x] Semantic city guide: `C:\Users\49337\OneDrive\Desktop\Desktop\实习\光明\SEMANTIC_CITY.md`
+- [x] Semantic city one-click entry: `C:\Users\49337\OneDrive\Desktop\Desktop\实习\光明\START_SEMANTIC_CITY.cmd`
+- [x] Semantic city launcher: `C:\Users\49337\OneDrive\Desktop\Desktop\实习\光明\outputs\run_semantic_city.ps1`
+- [x] Semantic avoidance controller: `C:\Users\49337\OneDrive\Desktop\Desktop\实习\光明\outputs\semantic_obstacle_mission.py`
+- [x] Semantic verdict rules: `C:\Users\49337\OneDrive\Desktop\Desktop\实习\光明\outputs\semantic_mission_verdict.py`
+- [x] Semantic motion profile: `C:\Users\49337\OneDrive\Desktop\Desktop\实习\光明\outputs\semantic_motion_profile.py`
+- [x] Semantic route planner: `C:\Users\49337\OneDrive\Desktop\Desktop\实习\光明\outputs\semantic_route_planner.py`
+- [x] Semantic runtime config module: `C:\Users\49337\OneDrive\Desktop\Desktop\实习\光明\outputs\semantic_runtime_config.py`
+- [x] Semantic runtime config: `C:\Users\49337\OneDrive\Desktop\Desktop\实习\光明\outputs\semantic_runtime_config.json`
+- [x] Semantic vision detector: `C:\Users\49337\OneDrive\Desktop\Desktop\实习\光明\outputs\vision_detector.py`
+- [x] Urban semantic map: `C:\Users\49337\OneDrive\Desktop\Desktop\实习\光明\outputs\urban_semantic_map.json`
+- [x] Semantic regression launcher: `C:\Users\49337\OneDrive\Desktop\Desktop\实习\光明\outputs\run_semantic_regression.ps1`
+- [x] Semantic wind matrix launcher: `C:\Users\49337\OneDrive\Desktop\Desktop\实习\光明\outputs\run_semantic_wind_matrix.ps1`
+- [x] Semantic regression gates: `C:\Users\49337\OneDrive\Desktop\Desktop\实习\光明\outputs\semantic_regression_gates.py`
+- [x] Semantic dashboard: `C:\Users\49337\OneDrive\Desktop\Desktop\实习\光明\outputs\drone_dashboard.py`
+- [x] Semantic test plans: `C:\Users\49337\OneDrive\Desktop\Desktop\实习\光明\outputs\test-plans`
+- [x] Semantic wind validation report: `C:\Users\49337\OneDrive\Desktop\Desktop\实习\光明\outputs\semantic-wind-validation-20260730.md`
+- [x] Migration package builder: `C:\Users\49337\OneDrive\Desktop\Desktop\实习\光明\outputs\prepare_migration_package.ps1`
+- [x] PX4 launcher: `C:\Users\49337\OneDrive\Desktop\Desktop\实习\光明\outputs\start_px4_ue_hil.sh`
+- [x] MAVLink relay: `C:\Users\49337\OneDrive\Desktop\Desktop\实习\光明\outputs\mavlink_relay.py`
+- [x] QGC takeoff patch: `C:\Users\49337\OneDrive\Desktop\Desktop\实习\光明\outputs\px4-qgc-takeoff-p1-compat.patch`
+- [x] Rover external airframe: `C:\Users\49337\OneDrive\Desktop\Desktop\实习\光明\outputs\px4_airframes\51001_none_rover_ackermann`
+- [x] UE project: `D:\SZTUWindFieldPX4Demo\Unreal\SZTUWindFieldPX4Demo.uproject`
+- [x] UE VS config: `D:\SZTUWindFieldPX4Demo\Unreal\.vsconfig`
+- [x] UE Config: `D:\SZTUWindFieldPX4Demo\Unreal\Config`
+- [x] UE Content: `D:\SZTUWindFieldPX4Demo\Unreal\Content`
+- [x] UE Source: `D:\SZTUWindFieldPX4Demo\Unreal\Source`
+- [x] UE source assets: `D:\SZTUWindFieldPX4Demo\Unreal\SourceArt`
+- [x] Wind map: `D:\SZTUWindFieldPX4Demo\Unreal\Content\Maps\SZTUWindFieldDemoScene.umap`
+- [x] No-wind map: `D:\SZTUWindFieldPX4Demo\Unreal\Content\Maps\SZTUFlightPatternsScene.umap`
+- [x] Hexacopter map: `D:\SZTUWindFieldPX4Demo\Unreal\Content\Maps\SZTUHexacopterScene.umap`
+- [x] Rover map: `D:\SZTUWindFieldPX4Demo\Unreal\Content\Maps\SZTURoverScene.umap`
+- [x] Open factory flight map: `D:\SZTUWindFieldPX4Demo\Unreal\Content\Maps\SZTUFactoryFlightScene.umap`
+- [x] Factory wind flight map: `D:\SZTUWindFieldPX4Demo\Unreal\Content\Maps\SZTUFactoryWindScene.umap`
+- [x] Urban semantic flight map: `D:\SZTUWindFieldPX4Demo\Unreal\Content\Maps\SZTUUrbanSemanticScene.umap`
+- [x] Factory environment map: `D:\SZTUWindFieldPX4Demo\Unreal\Content\TrainEnvironment\Map\Demo.umap`
+- [x] Factory environment material: `D:\SZTUWindFieldPX4Demo\Unreal\Content\TrainEnvironment\Materials\Mat_Concrete_1.uasset`
+- [x] Factory environment mesh: `D:\SZTUWindFieldPX4Demo\Unreal\Content\TrainEnvironment\Meshes\SM_Floor_1.uasset`
+- [x] Hexacopter mesh: `D:\SZTUWindFieldPX4Demo\Unreal\Content\Vehicles\Hexacopter\Meshes\typhoon_h480_complete.uasset`
+- [x] Rover mesh: `D:\SZTUWindFieldPX4Demo\Unreal\Content\Vehicles\Rover\Meshes\rover_ackermann_complete.uasset`
+- [x] UE 5.8 editor: `D:\Epic Games\UE_5.8\Engine\Binaries\Win64\UnrealEditor.exe`
+- [x] QGroundControl: `C:\QGroundControl\bin\QGroundControl.exe`
+- [x] IFSC Station: `C:\IFSC-Station\IFSC-Station.exe`
+- [x] Validated recording 01_*.mp4: `C:\Users\49337\OneDrive\Desktop\QGC四场景录屏_20260722\01_单独场景_无风_QGC绕圆.mp4`
+- [x] Validated recording 02_*.mp4: `C:\Users\49337\OneDrive\Desktop\QGC四场景录屏_20260722\02_工厂场景_无风_QGC绕圆.mp4`
+- [x] Validated recording 03_*.mp4: `C:\Users\49337\OneDrive\Desktop\QGC四场景录屏_20260722\03_单独场景_8ms风场_QGC绕圆.mp4`
+- [x] Validated recording 04_*.mp4: `C:\Users\49337\OneDrive\Desktop\QGC四场景录屏_20260722\04_工厂场景_8ms风场_QGC绕圆.mp4`
+- [x] Recording validation report: `C:\Users\49337\OneDrive\Desktop\Desktop\实习\光明\outputs\QGC_FOUR_SCENE_RECORDING_REPORT_20260722.md`

@@ -178,7 +178,14 @@ except ValueError:
     invalid_after_land = True
 check("plan rejects step after land", invalid_after_land)
 dd.run_controller_task = make_fake(stop_mode=False)
-plan_res = dd.execute_plan(normalized)
+dd.UNREAL_ROUTE_PREVIEW_PATH = os.path.join(tmp, "semantic_route_preview.json")
+dd.trajectory_preview_state["path"] = dd.UNREAL_ROUTE_PREVIEW_PATH
+dd.explainability_store = dd.ExplainabilityStore(
+    os.path.join(tmp, "semantic-explainability"))
+preview_res = dd.generate_trajectory_preview(normalized)
+check("plan preview returns explanation id",
+      bool(preview_res.get("explanation_id")))
+plan_res = dd.execute_plan(normalized, preview_res.get("explanation_id"))
 check("plan execute returns task", bool(plan_res.get("task_id")))
 time.sleep(0.4)
 plan_task = dd.get_task_status(plan_res["task_id"])
@@ -195,12 +202,12 @@ check("task log has expand control", "openLogModal()" in dd.DASHBOARD_HTML)
 check("task log modal exists", 'id="log-modal-content"' in dd.DASHBOARD_HTML)
 check("task log keeps full history",
       "latestTaskLog=(d.log||[]).join" in dd.DASHBOARD_HTML)
-check("map explicitly labels positive Y upward",
-      "Y+ 向上" in dd.DASHBOARD_HTML and "Y+ ↑" in dd.DASHBOARD_HTML)
-check("map uses conventional positive-Y-up transform",
-      "function w2s(x,y){return [ox+x*scale,oy+y*scale];}" in dd.DASHBOARD_HTML and
+check("map explicitly labels NED north-up and east-right",
+      "北（X+）↑" in dd.DASHBOARD_HTML and "东（Y+）→" in dd.DASHBOARD_HTML)
+check("map uses QGC-style north-up NED transform",
+      "function w2s(x,y){const [east,north]=mapLocalToDisplayXY(x,y);return [ox+east*scale,oy-north*scale];}" in dd.DASHBOARD_HTML and
       "function d2s(x,y){return [ox+x*scale,oy-y*scale];}" in dd.DASHBOARD_HTML and
-      "return [x||0,-(y||0)];" in dd.DASHBOARD_HTML and
+      "return [y||0,x||0];" in dd.DASHBOARD_HTML and
       "return mapLocalToDisplayXY(localX,localY);" in dd.DASHBOARD_HTML)
 check("display transforms are centralized and display-only",
       "function mapLocalToDisplayXY(x,y)" in dd.DASHBOARD_HTML and
@@ -295,6 +302,13 @@ check("every planned segment clears expanded obstacle",
       safe_route and all(
           segment_is_clear(a, b, map_data["obstacles"], DEFAULT_CLEARANCE_M)
           for a, b in zip(safe_route["points"], safe_route["points"][1:])))
+vertical_route = plan_safe_route(
+    (0.0, 0.0), (0.0, 0.0), map_data["obstacles"])
+check("planner preserves zero-XY vertical leg", vertical_route is not None)
+check("vertical leg keeps start and target endpoints",
+      vertical_route and len(vertical_route["points"]) == 2)
+check("vertical leg has zero horizontal distance",
+      vertical_route and vertical_route["distance_m"] == 0.0)
 hard_route_review = dd.build_plan_review([
     {"action": "fly_to", "goal_id": "inspection_gate"},
     {"action": "fly_to", "goal_id": "medical_station"},

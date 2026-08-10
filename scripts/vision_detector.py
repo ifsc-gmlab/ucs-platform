@@ -24,13 +24,17 @@ A general model (e.g. YOLOv8) remains a future upgrade, supported via
 """
 
 import argparse
+import datetime
 import glob
+import hashlib
 import json
 import os
 import sys
 import time
 
 import numpy as np
+
+from ifsc_event_log import append_event
 
 try:
     import cv2
@@ -57,6 +61,11 @@ LANDMARK_COLORS["medical_station_red2"] = {
 }
 
 DEFAULT_MIN_AREA_FRAC = 0.002  # min blob area as fraction of frame area (lowered for distant/standoff markers)
+VISION_SCHEMA_VERSION = "ifsc.vision.detection.v1"
+CANONICAL_CLASSES = frozenset({
+    "start_pad", "inspection_gate", "delivery_zone", "medical_station",
+    "road_crack", "pest", "plant", "bird",
+})
 
 
 def detect_with_opencv(frame, min_area_frac=DEFAULT_MIN_AREA_FRAC):
@@ -93,9 +102,13 @@ def detect_with_opencv(frame, min_area_frac=DEFAULT_MIN_AREA_FRAC):
                 "label": label,
                 "color": label,
                 "bbox": [int(x), int(y), int(cw), int(ch)],
+                "bbox_xyxy": [int(x), int(y), int(x + cw), int(y + ch)],
                 "center": [float(cx), float(cy)],
                 "area": int(area),
                 "confidence": round(confidence, 3),
+                "class_id": None,
+                "raw_label": label,
+                "backend": "opencv_landmark",
             })
 
     # Merge duplicate labels (e.g. red two-band) keeping the strongest.
@@ -107,16 +120,18 @@ def detect_with_opencv(frame, min_area_frac=DEFAULT_MIN_AREA_FRAC):
     return list(best.values())
 
 
-def detect_with_yolo(frame, model, min_area_frac=DEFAULT_MIN_AREA_FRAC):
-    """Optional YOLOv8-nano delegate. Requires ultralytics + a trained/labeled
-    model. Falls back to OpenCV detection if YOLO finds nothing."""
+def detect_with_yolo(frame, model, min_area_frac=DEFAULT_MIN_AREA_FRAC,
+                     class_map=None, allowed_classes=CANONICAL_CLASSES):
+    """Run a YOLO-compatible model and return canonical IFSC detections."""
     h, w = frame.shape[:2]
     results = model(frame, verbose=False)[0]
     detections = []
+    class_map = class_map or {}
     for box in results.boxes:
         cls_id = int(box.cls[0])
-        name = results.names[cls_id]
-        if name not in LANDMARK_COLORS:
+        raw_name = str(results.names[cls_id])
+        name = class_map.get(raw_name, raw_name)
+        if name not in allowed_classes:
             continue
         x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
         area = (x2 - x1) * (y2 - y1)
@@ -127,12 +142,45 @@ def detect_with_yolo(frame, model, min_area_frac=DEFAULT_MIN_AREA_FRAC):
         detections.append({
             "label": name, "color": name,
             "bbox": [x1, y1, x2 - x1, y2 - y1],
+            "bbox_xyxy": [x1, y1, x2, y2],
             "center": [(x1 + x2) / 2.0, (y1 + y2) / 2.0],
             "area": int(area), "confidence": round(conf, 3),
+            "class_id": cls_id, "raw_label": raw_name, "backend": "yolo",
         })
-    if detections:
-        return detections
-    return detect_with_opencv(frame, min_area_frac)
+    return detections
+
+
+def _frame_sha256(path):
+    if not path or not os.path.isfile(path):
+        return None
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def detection_envelope(frame_path, frame, detections, backend,
+                       model_name=None, fallback_used=False, error=None):
+    size = None
+    if frame is not None:
+        height, width = frame.shape[:2]
+        size = {"width": int(width), "height": int(height)}
+    return {
+        "schema_version": VISION_SCHEMA_VERSION,
+        "timestamp_utc": datetime.datetime.now(
+            datetime.timezone.utc).isoformat(),
+        "frame": frame_path,
+        "frame_sha256": _frame_sha256(frame_path),
+        "image_size": size,
+        "detector": {
+            "backend": backend,
+            "model": model_name,
+            "fallback_used": bool(fallback_used),
+        },
+        "detections": detections,
+        "error": error,
+    }
 
 
 def list_run_dirs(base):
@@ -281,24 +329,58 @@ def main():
     parser.add_argument("--watch", type=float, default=0.0,
                         help="if >0, poll camera-dir for this many seconds")
     parser.add_argument("--yolo", help="optional YOLOv8 .pt weights")
+    parser.add_argument("--class-map", help="JSON map from YOLO labels to canonical IFSC labels")
+    parser.add_argument("--allow-fallback", action="store_true",
+                        help="allow explicit YOLO load failure to use the synthetic OpenCV backend")
+    parser.add_argument("--jsonl-log", help="append versioned detection events to this JSONL file")
     parser.add_argument("--out", help="optional annotated output image path")
     parser.add_argument("--min-area", type=float, default=DEFAULT_MIN_AREA_FRAC)
     args = parser.parse_args()
 
     model = None
+    backend = "opencv_landmark"
+    fallback_used = False
+    class_map = {}
+    if args.class_map:
+        try:
+            with open(args.class_map, "r", encoding="utf-8") as handle:
+                class_map = json.load(handle)
+            if not isinstance(class_map, dict) or not all(
+                    isinstance(k, str) and isinstance(v, str)
+                    for k, v in class_map.items()):
+                raise ValueError("class map must be a JSON object of string-to-string mappings")
+            unknown = sorted(set(class_map.values()) - CANONICAL_CLASSES)
+            if unknown:
+                raise ValueError("class map contains non-canonical labels: %s" % ", ".join(unknown))
+        except Exception as exc:
+            sys.stderr.write("ERROR: invalid --class-map (%s)\n" % exc)
+            return 2
     if args.yolo:
         try:
             from ultralytics import YOLO
             model = YOLO(args.yolo)
+            backend = "yolo"
             sys.stderr.write("[vision] YOLO model loaded: %s\n" % args.yolo)
-        except Exception as exc:  # pragma: no cover
-            sys.stderr.write("[vision] YOLO unavailable (%s); using OpenCV\n" % exc)
-            model = None
+        except Exception as exc:  # pragma: no cover - optional dependency/model
+            if not args.allow_fallback:
+                sys.stderr.write("ERROR: requested YOLO model unavailable (%s)\n" % exc)
+                return 2
+            sys.stderr.write("[vision] YOLO unavailable (%s); explicit fallback to OpenCV\n" % exc)
+            fallback_used = True
 
     def run_detection(frame):
         if model is not None:
-            return detect_with_yolo(frame, model, args.min_area)
+            return detect_with_yolo(
+                frame, model, args.min_area, class_map=class_map)
         return detect_with_opencv(frame, args.min_area)
+
+    def emit(frame_path, frame, detections):
+        envelope = detection_envelope(
+            frame_path, frame, detections, backend,
+            model_name=args.yolo if model is not None else None,
+            fallback_used=fallback_used)
+        print(json.dumps(envelope, ensure_ascii=False), flush=True)
+        append_event(args.jsonl_log, "vision.detection.completed", envelope)
 
     if args.frame:
         frame = cv2.imread(args.frame)
@@ -308,7 +390,7 @@ def main():
         dets = run_detection(frame)
         if args.out:
             cv2.imwrite(args.out, annotate(frame, dets))
-        print(json.dumps({"frame": args.frame, "detections": dets}, ensure_ascii=False))
+        emit(args.frame, frame, dets)
         return 0
 
     if args.watch > 0:
@@ -319,20 +401,19 @@ def main():
             if frame is not None and fname != last_seen:
                 last_seen = fname
                 dets = run_detection(frame)
-                print(json.dumps({"frame": fname, "detections": dets}, ensure_ascii=False),
-                      flush=True)
+                emit(fname, frame, dets)
             time.sleep(0.1)
         return 0
 
     # Single-shot newest-frame mode (used by the controller each nav tick).
     fname, frame = latest_frame(args.camera_dir)
     if frame is None:
-        print(json.dumps({"frame": None, "detections": []}, ensure_ascii=False))
+        emit(None, None, [])
         return 0
     dets = run_detection(frame)
     if args.out:
         cv2.imwrite(args.out, annotate(frame, dets))
-    print(json.dumps({"frame": fname, "detections": dets}, ensure_ascii=False))
+    emit(fname, frame, dets)
     return 0
 
 

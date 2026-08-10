@@ -2,9 +2,19 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/GameModeBase.h"
+#include "GameFramework/HUD.h"
 #include "SZTUWindFieldGameMode.generated.h"
 
 class USZTUWindControlWidget;
+
+UCLASS()
+class SZTUWINDFIELDPX4DEMO_API ASZTUDualCameraHUD : public AHUD
+{
+    GENERATED_BODY()
+
+public:
+    virtual void DrawHUD() override;
+};
 
 UCLASS()
 class SZTUWINDFIELDPX4DEMO_API ASZTUWindFieldGameMode : public AGameModeBase

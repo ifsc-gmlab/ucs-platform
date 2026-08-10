@@ -131,6 +131,16 @@ void ASZTUWindFieldActor::SetRuntimeWindSpeedMps(float WindSpeedMps)
     bUseFAWG05MeasuredCurve = false;
     bUseFAWG05CycleProgram = false;
     bUseFAWG05VerticalCutProfile = false;
+    if (FMath::IsNearlyZero(BaseWindMps))
+    {
+        // A zero-wind acceptance run must not retain positive Perlin noise,
+        // gust, shear, gradient, or vortex residuals from the map preset.
+        GustAmplitudeMps = 0.0f;
+        VerticalShearMpsPerM = 0.0f;
+        LateralGradientMpsPerM = 0.0f;
+        TurbulenceAmplitudeMps = 0.0f;
+        VortexStrengthMps = 0.0f;
+    }
     UE_LOG(LogSZTUWindField, Display, TEXT("Runtime wind speed set to %.2f m/s"), BaseWindMps);
 }
 

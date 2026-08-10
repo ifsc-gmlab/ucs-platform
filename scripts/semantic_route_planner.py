@@ -98,6 +98,19 @@ def plan_safe_route(start, goal, obstacles, clearance_m=DEFAULT_CLEARANCE_M):
     if any(_point_inside_box(goal, item, clearance_m) for item in obstacles):
         return None
 
+    # A vertical takeoff/landing leg has identical XY endpoints but a different
+    # altitude in the 3D mission. Preserve both endpoints so the caller can
+    # interpolate Z and publish the vertical segment to UE5. The visibility
+    # graph would otherwise de-duplicate them and lose its goal node.
+    if math.hypot(goal[0] - start[0], goal[1] - start[1]) < _EPSILON:
+        point = [round(start[0], 4), round(start[1], 4)]
+        return {
+            "points": [point, list(point)],
+            "distance_m": 0.0,
+            "detour_waypoints": 0,
+            "clearance_m": float(clearance_m),
+        }
+
     nodes = [start, goal]
     for obstacle in obstacles:
         x_min, x_max, y_min, y_max = _expanded_bounds(

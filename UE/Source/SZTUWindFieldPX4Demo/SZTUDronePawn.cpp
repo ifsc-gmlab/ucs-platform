@@ -11,6 +11,8 @@
 #include "Engine/StaticMesh.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Misc/FileHelper.h"
+#include "Misc/Paths.h"
+#include "HAL/FileManager.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 #include "Components/InputComponent.h"
@@ -33,6 +35,7 @@
 #include "Misc/Parse.h"
 #include "SZTUWindFieldPX4Demo.h"
 #include "SZTUMavlinkSITLComponent.h"
+#include "SZTUFlightControllerComponent.h"
 
 ASZTUDronePawn::ASZTUDronePawn()
 {
@@ -49,6 +52,9 @@ ASZTUDronePawn::ASZTUDronePawn()
     OnboardCamera->SetRelativeLocation(FVector(28.0f, 0.0f, 10.0f));
     OnboardCamera->SetRelativeRotation(FRotator(-6.0f, 0.0f, 0.0f));
     OnboardCamera->SetFieldOfView(92.0f);
+    OnboardCamera->PostProcessSettings.bOverride_AutoExposureBias = true;
+    OnboardCamera->PostProcessSettings.AutoExposureBias = 2.0f;
+    OnboardCamera->PostProcessBlendWeight = 1.0f;
     OnboardCamera->SetAutoActivate(false);
 
     // Vision capture camera (same pose as onboard camera, renders to texture)
@@ -61,6 +67,12 @@ ASZTUDronePawn::ASZTUDronePawn()
     // HDR scene-color capture was written straight into an 8-bit PNG, making
     // the dashboard preview look almost completely black.
     VisionCapture->CaptureSource = ESceneCaptureSource::SCS_FinalColorLDR;
+    VisionCapture->PostProcessSettings.bOverride_AutoExposureBias = true;
+    VisionCapture->PostProcessSettings.AutoExposureBias = 2.0f;
+    VisionCapture->PostProcessBlendWeight = 1.0f;
+    // Manual one-Hz captures otherwise discard temporal exposure history and
+    // repeatedly produce a near-black first frame.
+    VisionCapture->bAlwaysPersistRenderingState = true;
     VisionCapture->bCaptureEveryFrame = false;
     VisionCapture->bCaptureOnMovement = false;
 
@@ -308,8 +320,8 @@ void ASZTUDronePawn::BeginPlay()
     const FString CurrentMapName = GetWorld() ? GetWorld()->GetMapName() : FString();
     const bool bFactoryWindScene = CurrentMapName.Contains(TEXT("FactoryWindScene"));
     const bool bFactoryDualScene = CurrentMapName.Contains(TEXT("FactoryDualScene"));
-    const bool bUrbanSemanticScene = CurrentMapName.Contains(TEXT("UrbanSemanticScene"));
-    if (bUrbanSemanticScene)
+    const bool bSemanticScene = CurrentMapName.Contains(TEXT("SemanticScene"));
+    if (bSemanticScene)
     {
         bEnableProximitySensors = true;
         bEnableHorizontalCollisionSweep = true;
@@ -377,11 +389,12 @@ void ASZTUDronePawn::BeginPlay()
         SITLComponent->SetActuatorCount(bHexaX ? 6 : 4);
         // 双机并行：按 DroneId 设 TCP 端口（DroneId=1→4560, DroneId=2→4561）
         // 单机场景默认 DroneId=1 跟旧版完全一致。
-        SITLComponent->ListenPort = 4559 + DroneId;
+        SITLComponent->SetTransportPort(4559 + DroneId);
         // SITLComponent BeginPlay 已经用旧 ListenPort=4560 bind 过了，
         // 改完 ListenPort 必须重新 bind，否则 DroneId=2 仍然 listen 4560。
-        SITLComponent->ReinitServerSocket();
-        UE_LOG(LogSZTUWindField, Display, TEXT("DronePawn id=%d → SITL TCP port %d"), DroneId, SITLComponent->ListenPort);
+        SITLComponent->ReinitializeTransport();
+        UE_LOG(LogSZTUWindField, Display, TEXT("DronePawn id=%d -> controller=%s transport port=%d"),
+            DroneId, *SITLComponent->GetBackendName().ToString(), SITLComponent->GetTransportPort());
     }
     ApplyMaterialsAtRuntime();
 
@@ -407,6 +420,9 @@ void ASZTUDronePawn::BeginPlay()
         SpawnLocation = (DroneId == 1) ? FVector(250.0f, 0.0f, 0.0f) : FVector(250.0f - (DroneId - 1) * 500.0f, 0.0f, 0.0f);
     }
     SetActorLocation(SpawnLocation);
+    SemanticRouteOriginWorld = SpawnLocation;
+    SemanticRoutePreviewPath = FPaths::ProjectSavedDir() / TEXT("semantic_route_preview.json");
+    RefreshSemanticRoutePreview(0.0f, true);
     UE_LOG(LogSZTUWindField, Display, TEXT("Drone spawned at %s (DroneId=%d)"), *GetActorLocation().ToString(), DroneId);
 }
 
@@ -429,6 +445,9 @@ void ASZTUDronePawn::Tick(float DeltaSeconds)
 {
     Super::Tick(DeltaSeconds);
     if (DeltaSeconds <= KINDA_SMALL_NUMBER) { return; }
+
+    RefreshSemanticRoutePreview(DeltaSeconds);
+    DrawSemanticRoutePreview();
 
     if (!WindField && !bWindFieldLookupComplete) { LocateOrSpawnWindField(); }
 
@@ -478,7 +497,8 @@ void ASZTUDronePawn::Tick(float DeltaSeconds)
     {
         for (int32 i = 0; i < RotorCount; ++i)
         {
-            CommandedThrustN += FMath::Clamp(MotorThrusts[i], 0.f, 1.f) * MaxMotorThrustN;
+            const float MotorCommand = FMath::Clamp(MotorThrusts[i], 0.f, 1.f);
+            CommandedThrustN += MotorCommand * MotorCommand * MaxMotorThrustN;
         }
     }
 
@@ -488,17 +508,54 @@ void ASZTUDronePawn::Tick(float DeltaSeconds)
         FMath::Abs(RollInput) > 0.01f ||
         FMath::Abs(YawInput) > 0.01f;
     const FVector CurrentLocation = GetActorLocation();
-    const bool bNearGround = CurrentLocation.Z <= 0.5f;
-    const bool bLiftCommanded = CommandedThrustN >= DroneMassKg * 9.81f * 0.95f;
+    const bool bNearGround = CurrentLocation.Z <= 2.0f;
+    const float VehicleWeightN = DroneMassKg * 9.81f;
+    const bool bLiftCommanded = CommandedThrustN >= VehicleWeightN * 0.98f;
+    const bool bStrongLiftCommanded = CommandedThrustN >= VehicleWeightN * 1.10f;
     const bool bAirborne = CurrentLocation.Z > 5.0f;
+
+    if (!bTouchdownLatched && bNearGround && VelocityMps.Z <= 0.05f)
+    {
+        bTouchdownLatched = true;
+        GroundReleaseTimerSec = 0.0f;
+    }
+    if (bTouchdownLatched)
+    {
+        GroundReleaseTimerSec = bStrongLiftCommanded
+            ? GroundReleaseTimerSec + DeltaSeconds : 0.0f;
+        if (GroundReleaseTimerSec >= 0.20f)
+        {
+            bTouchdownLatched = false;
+            GroundReleaseTimerSec = 0.0f;
+        }
+    }
     const bool bGroundLocked =
-        bNearGround &&
-        ((!bHasSITL && !bManualInputActive) || (bHasSITL && !bLiftCommanded && !bAirborne));
+        bTouchdownLatched ||
+        (bNearGround &&
+         ((!bHasSITL && !bManualInputActive) || (bHasSITL && !bLiftCommanded && !bAirborne)));
 
     const FVector WindAccel = bGroundLocked ? FVector::ZeroVector : (WindSample.VelocityMps - VelocityMps) * WindDragGain;
 
     if (bGroundLocked)
     {
+        // Keep the visual motor state live while armed on the ground, then let
+        // it decay naturally after DISARM instead of freezing the propellers.
+        if (bHasSITL)
+        {
+            const float MotorAlpha = 1.0f - FMath::Exp(-DeltaSeconds / MotorTau);
+            const int32 VisualRotorCount = FMath::Min(RotorCount, RotorDiscs.Num());
+            for (int32 i = 0; i < RotorCount; ++i)
+            {
+                const float TargetRPM = FMath::Clamp(MotorThrusts[i], 0.f, 1.f) * MaxRPM;
+                ActualRPM[i] += (TargetRPM - ActualRPM[i]) * MotorAlpha;
+                if (i < VisualRotorCount && RotorDiscs[i])
+                {
+                    const float Direction = (i == 0 || i == 2) ? -1.0f : 1.0f;
+                    RotorDiscs[i]->AddLocalRotation(
+                        FRotator(0.0f, Direction * ActualRPM[i] * 6.0f * DeltaSeconds, 0.0f));
+                }
+            }
+        }
         VelocityMps = FVector::ZeroVector;
         AngularVelocityRadS = FVector::ZeroVector;
         AccelMps2 = FVector::ZeroVector;
@@ -533,6 +590,20 @@ void ASZTUDronePawn::Tick(float DeltaSeconds)
             RollTorque  += T * MotorPY[i];   // 绕 X 轴（滚转）
             PitchTorque -= T * MotorPX[i];   // 绕 Y 轴（俯仰，前电机=低头）
             YawTorque   += T * MotorKM[i];   // 绕 Z 轴（偏航）
+        }
+
+        // Drive the visible propeller meshes from the same RPM state used by
+        // the thrust model. Adjacent rotors spin in opposite directions, just
+        // like the imported CW/CCW propeller assets.
+        const int32 VisualRotorCount = FMath::Min(RotorCount, RotorDiscs.Num());
+        for (int32 i = 0; i < VisualRotorCount; ++i)
+        {
+            if (UStaticMeshComponent* Rotor = RotorDiscs[i])
+            {
+                const float SpinDirection = (i == 0 || i == 2) ? -1.0f : 1.0f;
+                const float SpinDegrees = SpinDirection * ActualRPM[i] * 6.0f * DeltaSeconds;
+                Rotor->AddLocalRotation(FRotator(0.0f, SpinDegrees, 0.0f));
+            }
         }
 
         // 推力从机体坐标系转到世界坐标系（沿机体 Z 轴向上）
@@ -700,7 +771,7 @@ void ASZTUDronePawn::Tick(float DeltaSeconds)
                 WindSample.VelocityMps.X, WindSample.VelocityMps.Y, WindSample.VelocityMps.Z,
                 VelocityMps.X, VelocityMps.Y, VelocityMps.Z,
                 AccelMps2.Size(), WindAccel.Size(),
-                SITLComponent ? SITLComponent->ListenPort : 0);
+                SITLComponent ? SITLComponent->GetTransportPort() : 0);
         }
     }
 }
@@ -915,6 +986,7 @@ void ASZTUDronePawn::SendTelemetry(const FSZTUWindSample& WindSample, const FSZT
 void ASZTUDronePawn::SetupVisionCapture()
 {
     bVisionCaptureEnabled = FParse::Param(FCommandLine::Get(), TEXT("VisionCapture"));
+    bArchiveVisionFrames = FParse::Param(FCommandLine::Get(), TEXT("ArchiveVisionFrames"));
 
     // Also auto-enable in urban semantic scene
     if (!bVisionCaptureEnabled)
@@ -942,6 +1014,16 @@ void ASZTUDronePawn::SetupVisionCapture()
     {
         CaptureHzOverride = FMath::Clamp(CaptureHzOverride, 0.5f, 4.0f);
         VisionCaptureIntervalSec = 1.0f / CaptureHzOverride;
+    }
+    int32 CaptureWidthOverride = VisionCaptureWidth;
+    int32 CaptureHeightOverride = VisionCaptureHeight;
+    if (FParse::Value(FCommandLine::Get(), TEXT("VisionCaptureWidth="), CaptureWidthOverride))
+    {
+        VisionCaptureWidth = FMath::Clamp(CaptureWidthOverride, 320, 1920);
+    }
+    if (FParse::Value(FCommandLine::Get(), TEXT("VisionCaptureHeight="), CaptureHeightOverride))
+    {
+        VisionCaptureHeight = FMath::Clamp(CaptureHeightOverride, 180, 1080);
     }
 
     if (!bVisionCaptureEnabled || !VisionCapture) { return; }
@@ -971,13 +1053,80 @@ void ASZTUDronePawn::SetupVisionCapture()
         FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
 
     UE_LOG(LogSZTUWindField, Display,
-        TEXT("Vision capture enabled: %dx%d @ %.1fHz -> %s (gimbal pitch %.1f deg)"),
+        TEXT("Vision capture enabled: %dx%d @ %.1fHz -> %s (gimbal pitch %.1f deg, archive=%s)"),
         VisionCaptureWidth, VisionCaptureHeight,
         1.0f / VisionCaptureIntervalSec,
-        *VisionRunDir, VisionGimbalPitchDeg);
+        *VisionRunDir, VisionGimbalPitchDeg,
+        bArchiveVisionFrames ? TEXT("true") : TEXT("false"));
 
     VisionCaptureTimer = 0.0f;
     VisionCaptureFrameCount = 0;
+}
+
+void ASZTUDronePawn::RefreshSemanticRoutePreview(float DeltaSeconds, bool bForce)
+{
+    SemanticRoutePreviewPollSeconds += DeltaSeconds;
+    if (!bForce && SemanticRoutePreviewPollSeconds < 0.5f) { return; }
+    SemanticRoutePreviewPollSeconds = 0.0f;
+    if (SemanticRoutePreviewPath.IsEmpty() || !FPaths::FileExists(SemanticRoutePreviewPath)) { return; }
+
+    const FDateTime Timestamp = IFileManager::Get().GetTimeStamp(*SemanticRoutePreviewPath);
+    if (!bForce && Timestamp == SemanticRoutePreviewTimestamp) { return; }
+
+    FString JsonText;
+    if (!FFileHelper::LoadFileToString(JsonText, *SemanticRoutePreviewPath)) { return; }
+    TSharedPtr<FJsonObject> Root;
+    const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(JsonText);
+    if (!FJsonSerializer::Deserialize(Reader, Root) || !Root.IsValid()) { return; }
+
+    const TArray<TSharedPtr<FJsonValue>>* RoutePoints = nullptr;
+    if (!Root->TryGetArrayField(TEXT("route_points"), RoutePoints) || RoutePoints->Num() < 2) { return; }
+
+    TArray<FVector> ParsedPoints;
+    TArray<FString> ParsedLabels;
+    for (const TSharedPtr<FJsonValue>& Value : *RoutePoints)
+    {
+        const TSharedPtr<FJsonObject> Point = Value.IsValid() ? Value->AsObject() : nullptr;
+        if (!Point.IsValid()) { continue; }
+        double X = 0.0, Y = 0.0, Z = 0.0;
+        if (!Point->TryGetNumberField(TEXT("x_m"), X)
+            || !Point->TryGetNumberField(TEXT("y_m"), Y)
+            || !Point->TryGetNumberField(TEXT("z_m"), Z)) { continue; }
+        ParsedPoints.Add(SemanticRouteOriginWorld + FVector(X, Y, Z) * 100.0f);
+        FString Label;
+        Point->TryGetStringField(TEXT("label"), Label);
+        ParsedLabels.Add(Label);
+    }
+    if (ParsedPoints.Num() < 2) { return; }
+    SemanticRoutePointsWorld = MoveTemp(ParsedPoints);
+    SemanticRoutePointLabels = MoveTemp(ParsedLabels);
+    SemanticRoutePreviewTimestamp = Timestamp;
+    UE_LOG(LogSZTUWindField, Display,
+        TEXT("Semantic UE5 trajectory loaded: %d points from %s"),
+        SemanticRoutePointsWorld.Num(), *SemanticRoutePreviewPath);
+}
+
+void ASZTUDronePawn::DrawSemanticRoutePreview() const
+{
+    UWorld* World = GetWorld();
+    if (!World || SemanticRoutePointsWorld.Num() < 2) { return; }
+
+    const FColor RouteColor(80, 230, 255);
+    const FColor ArrowColor(180, 80, 255);
+    const FColor WaypointColor(255, 210, 45);
+    for (int32 Index = 1; Index < SemanticRoutePointsWorld.Num(); ++Index)
+    {
+        const FVector& Start = SemanticRoutePointsWorld[Index - 1];
+        const FVector& End = SemanticRoutePointsWorld[Index];
+        DrawDebugLine(World, Start, End, RouteColor, false, -1.0f, 0, 3.0f);
+        const FVector Direction = (End - Start).GetSafeNormal();
+        const FVector Mid = FMath::Lerp(Start, End, 0.55f);
+        DrawDebugDirectionalArrow(World, Mid - Direction * 35.0f, Mid + Direction * 35.0f,
+            18.0f, ArrowColor, false, -1.0f, 0, 3.0f);
+        DrawDebugSphere(World, End, 12.0f, 12, WaypointColor, false, -1.0f, 0, 2.0f);
+    }
+    DrawDebugSphere(World, SemanticRoutePointsWorld[0], 14.0f, 12,
+        FColor::Green, false, -1.0f, 0, 2.0f);
 }
 
 void ASZTUDronePawn::SpawnSemanticLandmarks()
@@ -1111,16 +1260,33 @@ void ASZTUDronePawn::UpdateVisionGimbal()
     // Stabilized gimbal: drop body roll/pitch, keep yaw, apply fixed forward-down
     // tilt. Applied to both the vision-capture camera and the onboard view camera
     // so the picture stays level regardless of airframe attitude.
-    const FRotator ActorRot = GetActorRotation();
-    // Unreal uses negative camera pitch for a downward look direction.
-    const FRotator GimbalRot(-VisionGimbalPitchDeg, ActorRot.Yaw, 0.0f);
+    const FString MapName = GetWorld() ? GetWorld()->GetMapName() : FString();
+    FRotator GimbalRot;
+    if (MapName.Contains(TEXT("SZTULargeBridgeSemanticScene")) &&
+        FParse::Param(FCommandLine::Get(), TEXT("DualCameraView")) && VisionCapture)
+    {
+        // During the bridge orbit, keep the inspection camera aimed at the
+        // structure instead of following vehicle yaw into the empty sky.
+        const FVector BridgeAimPoint(2750.0f, 0.0f, 100.0f);
+        GimbalRot = (BridgeAimPoint - VisionCapture->GetComponentLocation()).Rotation();
+    }
+    else
+    {
+        const FRotator ActorRot = GetActorRotation();
+        // Unreal uses negative camera pitch for a downward look direction.
+        GimbalRot = FRotator(-VisionGimbalPitchDeg, ActorRot.Yaw, 0.0f);
+    }
     if (VisionCapture)
     {
-        VisionCapture->SetWorldRotation(GimbalRot);
+        const float DeltaSeconds = GetWorld() ? GetWorld()->GetDeltaSeconds() : (1.0f / 60.0f);
+        VisionCapture->SetWorldRotation(FMath::RInterpTo(
+            VisionCapture->GetComponentRotation(), GimbalRot, DeltaSeconds, 5.0f));
     }
     if (OnboardCamera)
     {
-        OnboardCamera->SetWorldRotation(GimbalRot);
+        const float DeltaSeconds = GetWorld() ? GetWorld()->GetDeltaSeconds() : (1.0f / 60.0f);
+        OnboardCamera->SetWorldRotation(FMath::RInterpTo(
+            OnboardCamera->GetComponentRotation(), GimbalRot, DeltaSeconds, 5.0f));
     }
 }
 
@@ -1170,6 +1336,12 @@ void ASZTUDronePawn::CaptureVisionFrame()
         if (PngData.Num() > 0)
         {
             FFileHelper::SaveArrayToFile(PngData, *FullPath);
+            if (bArchiveVisionFrames)
+            {
+                const FString ArchiveName = FString::Printf(
+                    TEXT("frame_%06d.png"), VisionCaptureFrameCount);
+                FFileHelper::SaveArrayToFile(PngData, *(VisionRunDir / ArchiveName));
+            }
         }
     }
 }

@@ -1,0 +1,11 @@
+{
+  "steps": [
+    { "action": "fly_to", "goal_id": "bridge_entry", "vision": false },
+    { "action": "fly_to", "goal_id": "bridge_ascent", "vision": false },
+    { "action": "fly_to", "goal_id": "bridge_apex", "vision": false },
+    { "action": "fly_to", "goal_id": "bridge_descent", "vision": false },
+    { "action": "fly_to", "goal_id": "bridge_exit", "vision": false },
+    { "action": "fly_to", "goal_id": "far_pad", "vision": false },
+    { "action": "land" }
+  ]
+}

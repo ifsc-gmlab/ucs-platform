@@ -16,14 +16,22 @@ param(
   [int]$EstimatorSettleSec = 35,
   [ValidateRange(30, 300)]
   [int]$UeStartupTimeoutSec = 180,
-  [ValidateRange(0.0, 15.0)]
-  [double]$WindMps = 0.0,
+  [ValidateRange(-1.0, 15.0)]
+  [double]$WindMps = -1.0,
   [ValidateRange(0.5, 10.0)]
   [double]$CameraCaptureHz = 2.0,
+  [ValidateRange(320, 1920)]
+  [int]$CameraWidth = 320,
+  [ValidateRange(180, 1080)]
+  [int]$CameraHeight = 180,
   [string]$Distro = "Ubuntu",
+  [string]$ProjectRoot = "D:\SZTUWindFieldPX4Demo\Unreal",
   [switch]$OnboardCamera,
+  [switch]$FollowDroneCamera,
+  [switch]$DualCameraView,
   [switch]$ShowSensorRays,
   [switch]$Vision,
+  [switch]$ArchiveFrames,
   [switch]$KeepRunning,
   [switch]$DryRun
 )
@@ -35,6 +43,7 @@ Set-StrictMode -Version Latest
 # with -RedirectStandard* forces UseShellExecute=false and .NET then throws
 # "字典中的关键字:Path 所添加的关键字:PATH". Collapse to a single key up front.
 $inheritedPath = $env:Path
+$missionSucceeded = $false
 try {
   [Environment]::SetEnvironmentVariable("Path", $null, "Process")
   [Environment]::SetEnvironmentVariable("PATH", $null, "Process")
@@ -87,7 +96,8 @@ if ($UeMap -notmatch "^/Game/[A-Za-z0-9_./-]+$" -or $UeMap.Contains("..")) {
   throw "invalid UE map asset path: $UeMap"
 }
 $UeMapRelativePath = $UeMap.Substring("/Game/".Length).Replace("/", "\")
-$UeMapAsset = Join-Path "D:\SZTUWindFieldPX4Demo\Unreal\Content" ($UeMapRelativePath + ".umap")
+$ProjectFile = Join-Path $ProjectRoot "SZTUWindFieldPX4Demo.uproject"
+$UeMapAsset = Join-Path (Join-Path $ProjectRoot "Content") ($UeMapRelativePath + ".umap")
 $WslExe = Join-Path $env:WINDIR "System32\wsl.exe"
 if (-not (Test-Path -LiteralPath $WslExe)) { throw "WSL executable not found: $WslExe" }
 $PowerShellExe = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
@@ -188,13 +198,18 @@ if ($PlanFile) {
 
 $extraUEArgs = @()
 if ($OnboardCamera) { $extraUEArgs += "-OnboardCamera" }
+if ($FollowDroneCamera) { $extraUEArgs += "-FollowDroneCamera" }
+if ($DualCameraView) { $extraUEArgs += "-DualCameraView" }
 if ($ShowSensorRays) { $extraUEArgs += "-ShowSensorRays" }
 if ($Vision) { $extraUEArgs += "-VisionCapture" }
+if ($ArchiveFrames) { $extraUEArgs += "-ArchiveVisionFrames" }
 if ($CameraCaptureHz -gt 0) {
   $cameraHzText = $CameraCaptureHz.ToString([Globalization.CultureInfo]::InvariantCulture)
   $extraUEArgs += "-VisionCaptureHz=$cameraHzText"
 }
-if ($WindMps -gt 0) {
+$extraUEArgs += "-VisionCaptureWidth=$CameraWidth"
+$extraUEArgs += "-VisionCaptureHeight=$CameraHeight"
+if ($WindMps -ge 0) {
   $windText = $WindMps.ToString([Globalization.CultureInfo]::InvariantCulture)
   $extraUEArgs += @("-SemanticWind", "-WindMps=$windText")
 }
@@ -213,6 +228,7 @@ if ($DryRun) {
   & $PythonExe -m py_compile $ControllerScript $VerdictRules $MotionProfile $RuntimeConfigModule $RoutePlanner $TakeoffScript $VisionDetector
   if ($LASTEXITCODE -ne 0) { throw "Python syntax validation failed" }
   & $VerifyScript `
+    -Project $ProjectFile `
     -Map $UeMap `
     -SkipFlight -SkipTelemetryListener -KeepRunning `
     -TelemetryHost "127.0.0.1" -TelemetryPort 14660 `
@@ -248,6 +264,9 @@ $RunManifest = [ordered]@{
   ).Hash.ToLowerInvariant()
   wind_mps = $WindMps
   camera_capture_hz = $CameraCaptureHz
+  camera_width = $CameraWidth
+  camera_height = $CameraHeight
+  archive_frames = [bool]$ArchiveFrames
   runtime_sha256 = $RuntimeHashes
 }
 $RunManifest | ConvertTo-Json -Depth 4 |
@@ -286,7 +305,7 @@ try {
   if ($Vision) {
     # Copy the semantic map next to the uproject so the C++ landmark spawner
     # can read goal coordinates (it also has hardcoded fallbacks).
-    $projectJson = "D:\SZTUWindFieldPX4Demo\Unreal\urban_semantic_map.json"
+    $projectJson = Join-Path $ProjectRoot "urban_semantic_map.json"
     Copy-Item -LiteralPath $SemanticMap -Destination $projectJson -Force
     Write-Host "[semantic-city] copied semantic map -> $projectJson"
   }
@@ -300,6 +319,7 @@ try {
     try {
       Write-Host "[semantic-city] UE/PX4 startup attempt $startupAttempt/2"
       & $VerifyScript `
+        -Project $ProjectFile `
         -Map $UeMap `
         -Vehicle quad `
         -GraphicsRhi dx11 `
@@ -308,7 +328,9 @@ try {
         -TelemetryHost $WslIp -TelemetryPort 14660 `
         -ExtraUEArgs $extraUEArgs `
         -TcpTimeoutSec $UeStartupTimeoutSec `
-        -EstimatorSettleSec $EstimatorSettleSec
+        -EstimatorSettleSec $EstimatorSettleSec `
+        -GroundGateMaxAttempts 10 `
+        -GroundGateRequiredConsecutive 2
       $startupReady = $true
       break
     }
@@ -335,6 +357,15 @@ try {
   if (-not $startupReady) {
     $startupMessage = if ($startupError) { $startupError.Exception.Message } else { "unknown startup error" }
     throw "UE/PX4 startup failed after 2 attempts: $startupMessage"
+  }
+
+  # The semantic dashboard publishes the authoritative route before execution.
+  # Give UE5 a short, explicit preview stage so the operator (and recording)
+  # can see the complete trajectory before the aircraft arms and follows it.
+  $routePreviewPath = Join-Path $ProjectRoot "Saved\semantic_route_preview.json"
+  if (Test-Path -LiteralPath $routePreviewPath) {
+    Write-Host "[semantic-city] UE5 trajectory preview loaded; holding 25 seconds before flight"
+    Start-Sleep -Seconds 25
   }
 
   $mapWsl = Get-WslPath $SemanticMap
@@ -408,6 +439,14 @@ try {
     $result.pass = $false
     $result.failure = "requested wind was not observed in UE telemetry"
   }
+  if (
+    $WindMps -eq 0 -and
+    [double]$result.wind.max_speed_mps -gt 0.05
+  ) {
+    $verdict = "CHECK"
+    $result.pass = $false
+    $result.failure = "zero-wind run observed non-zero UE wind telemetry"
+  }
   $summary = @(
     "# Semantic City Mission Summary",
     "",
@@ -419,6 +458,9 @@ try {
     "- Reached: $($result.reached)",
     "- Vision enabled: $($result.vision_enabled)",
     "- Vision confirmed: $($result.vision_confirmed)",
+    "- Camera capture: ${CameraWidth}x${CameraHeight} @ ${CameraCaptureHz} Hz",
+    "- Full-frame archive enabled: $([bool]$ArchiveFrames)",
+    "- Camera frames root: $(Join-Path $ProjectRoot 'Saved\CameraFrames')",
     "- Avoidance events: $($result.avoidance_events)",
     "- Planned detour waypoints: $($result.planned_detour_waypoints)",
     "- Avoidance-required legs: $($result.avoidance_required_legs)",
@@ -444,6 +486,7 @@ try {
   if ($verdict -ne "PASS") {
     throw "semantic mission validation failed; see $RunDir"
   }
+  $missionSucceeded = $true
 }
 finally {
   if (-not $KeepRunning) {
@@ -460,4 +503,11 @@ finally {
   else {
     Write-Host "[semantic-city] KeepRunning set; UE/PX4 left running"
   }
+}
+
+# The emergency-stop helper intentionally reports a missing heartbeat after a
+# successful controller landing/disarm. Do not leak that cleanup status through
+# run_bridge_inspection.ps1 as a false mission failure.
+if ($missionSucceeded) {
+  $global:LASTEXITCODE = 0
 }

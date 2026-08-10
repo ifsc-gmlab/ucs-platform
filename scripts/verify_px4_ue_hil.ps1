@@ -28,6 +28,8 @@ param(
   [string]$GraphicsRhi = "dx12",
   [int]$WindowWidth = 1280,
   [int]$WindowHeight = 720,
+  [ValidateRange(0, 1000)]
+  [int]$MaxFps = 0,
   [switch]$NoSound,
   [double]$Alt = 2.0,
   [switch]$HeadwindTest,
@@ -56,6 +58,14 @@ param(
   [double]$Ekf2AblLim = 5.0,
   [ValidateRange(0, 120)]
   [int]$EstimatorSettleSec = 35,
+  [ValidateRange(3, 10)]
+  [int]$GroundGateMaxAttempts = 5,
+  [ValidateRange(2, 5)]
+  [int]$GroundGateRequiredConsecutive = 3,
+  [ValidateRange(1, 10)]
+  [int]$GroundGateIntervalSec = 3,
+  [ValidateRange(0.05, 1.0)]
+  [double]$GroundGateMaxVzMps = 0.30,
   [int]$TcpTimeoutSec = 90,
   [int]$Px4TimeoutSec = 120,
   [int]$FlightTimeoutSec = 90,
@@ -64,6 +74,7 @@ param(
   [ValidateRange(1, 65535)]
   [int]$TelemetryPort = 14660,
   [string[]]$ExtraUEArgs = @(),
+  [string]$WindowTitle = "IFSC Bridge Inspection Platform",
   [switch]$SkipTelemetryListener,
   [switch]$SkipFlight,
   [bool]$ShowWindArrows = $false,
@@ -110,6 +121,7 @@ $script:Status = [ordered]@{
   PX4Started = $false
   PX4Connected = $false
   PX4Ready = $false
+  GroundConvergencePassed = $false
   TelemetryStarted = $false
   FlightScriptRan = $false
   Armed = $false
@@ -140,6 +152,33 @@ function Require-File {
   }
 }
 
+function Resolve-PythonExecutable {
+  param([string]$RequestedPython)
+
+  if ($RequestedPython -and (Test-Path -LiteralPath $RequestedPython -PathType Leaf)) {
+    return (Resolve-Path -LiteralPath $RequestedPython).Path
+  }
+
+  if ($RequestedPython) {
+    $command = Get-Command $RequestedPython -CommandType Application -ErrorAction SilentlyContinue |
+      Select-Object -First 1
+    if ($command -and $command.Source) {
+      return $command.Source
+    }
+  }
+
+  # Offline UE installations include a standard-library Python runtime, which
+  # is sufficient for the UDP/JSON telemetry listener and avoids a separate
+  # machine-wide Python dependency.
+  $engineRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $UnrealEditor))
+  $uePython = Join-Path $engineRoot "Binaries\ThirdParty\Python3\Win64\python.exe"
+  if (Test-Path -LiteralPath $uePython -PathType Leaf) {
+    return (Resolve-Path -LiteralPath $uePython).Path
+  }
+
+  throw "Windows Python executable not found: requested '$RequestedPython'; UE fallback '$uePython'"
+}
+
 function Invoke-WslText {
   param([string]$Command)
   $oldPreference = $ErrorActionPreference
@@ -151,6 +190,156 @@ function Invoke-WslText {
   finally {
     $ErrorActionPreference = $oldPreference
   }
+}
+
+function Collect-Px4ReadinessDiagnostics {
+  Write-Step "collecting PX4 readiness diagnostics before cleanup"
+  $command = @"
+if [ -p /tmp/px4_cmd_fifo_1 ]; then
+  printf '%s\n' \
+    'commander check' \
+    'ekf2 status' \
+    'listener estimator_status 1' \
+    'listener estimator_innovations 1' \
+    'listener estimator_sensor_bias 1' \
+    'listener vehicle_local_position 1' \
+    'listener vehicle_local_position_groundtruth 1' \
+    'listener vehicle_odometry 1' \
+    'listener vehicle_visual_odometry 1' \
+    'listener vehicle_mocap_odometry 1' \
+    'listener sensor_combined 1' \
+    'listener sensor_accel 1' \
+    'listener vehicle_gps_position 1' \
+    > /tmp/px4_cmd_fifo_1
+  sleep 20
+fi
+"@
+  [void](Invoke-WslText $command)
+}
+
+function Remove-Px4Ansi {
+  param([string]$Text)
+  if ($null -eq $Text) { return "" }
+  return (($Text -replace "$([char]27)\[[0-9;?]*[ -/]*[@-~]", "") -replace "`r", "")
+}
+
+function Get-Px4TopicBlock {
+  param([string]$Text, [string]$Topic)
+  $match = [regex]::Match(
+    $Text,
+    "(?ms)TOPIC:\s*$([regex]::Escape($Topic))\b.*?(?=TOPIC:|\z)")
+  if ($match.Success) { return $match.Value }
+  return ""
+}
+
+function Get-Px4NumericField {
+  param([string]$Text, [string]$Field)
+  $match = [regex]::Match(
+    $Text,
+    "(?m)^\s*$([regex]::Escape($Field)):\s*([-+]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][-+]?[0-9]+)?)\s*$")
+  if (-not $match.Success) { return $null }
+  return [double]::Parse($match.Groups[1].Value, [System.Globalization.CultureInfo]::InvariantCulture)
+}
+
+function Invoke-Px4GroundConvergenceProbe {
+  $sizeText = [string](Invoke-WslText "test -f /tmp/px4_sitl_1.log && test -p /tmp/px4_cmd_fifo_1 && stat -c %s /tmp/px4_sitl_1.log || echo IFSC_GROUND_GATE_TRANSPORT_ERROR")
+  $sizeMatch = [regex]::Match($sizeText, "(?m)^\s*([0-9]+)\s*$")
+  if (-not $sizeMatch.Success) {
+    return "IFSC_GROUND_GATE_TRANSPORT_ERROR`n$sizeText"
+  }
+  $startByte = [int64]$sizeMatch.Groups[1].Value + 1
+  $writeCommand = "printf '%s\n' 'commander check' 'ekf2 status' 'listener estimator_status 1' 'listener vehicle_status 1' 'listener vehicle_local_position 1' 'listener vehicle_local_position_groundtruth 1' 'listener sensor_combined 1' > /tmp/px4_cmd_fifo_1"
+  [void](Invoke-WslText $writeCommand)
+  Start-Sleep -Seconds 3
+  return [string](Invoke-WslText "tail -c +$startByte /tmp/px4_sitl_1.log")
+}
+
+function Test-Px4GroundConvergence {
+  $gateLog = Join-Path $script:RunDir "ground_convergence_gate.log"
+  Set-Content -LiteralPath $gateLog -Value "IFSC PX4 ground convergence gate" -Encoding UTF8
+  $consecutive = 0
+  $previousZReset = $null
+  $previousVzReset = $null
+
+  Write-Step "checking post-settle PX4 ground convergence: require $GroundGateRequiredConsecutive consecutive passes in $GroundGateMaxAttempts attempts"
+  for ($attempt = 1; $attempt -le $GroundGateMaxAttempts; $attempt++) {
+    if ($script:PX4Proc.HasExited) {
+      throw "WSL PX4 launcher exited during ground convergence gate (exit $($script:PX4Proc.ExitCode))"
+    }
+
+    $raw = Invoke-Px4GroundConvergenceProbe
+    $clean = Remove-Px4Ansi $raw
+    Add-Content -LiteralPath $gateLog -Value "`r`n===== ATTEMPT $attempt RAW =====`r`n$clean" -Encoding UTF8
+
+    $estimator = Get-Px4TopicBlock $clean "estimator_status"
+    $vehicleStatus = Get-Px4TopicBlock $clean "vehicle_status"
+    $localPosition = Get-Px4TopicBlock $clean "vehicle_local_position"
+    $groundTruth = Get-Px4TopicBlock $clean "vehicle_local_position_groundtruth"
+    $sensor = Get-Px4TopicBlock $clean "sensor_combined"
+
+    $commanderPass =
+      ($clean -match "(?i)Preflight check:\s*(OK|PASSED)") -or
+      ($vehicleStatus -match "(?m)^\s*pre_flight_checks_pass:\s*True\s*$")
+    $commanderFailed = $clean -match "(?i)Preflight check:\s*FAILED"
+    $ekfPass =
+      ($clean -match "(?i)available instances:\s*[1-9]") -and
+      ($clean -match "(?i)attitude:\s*1,\s*local position:\s*1,\s*global position:\s*1") -and
+      ($clean -notmatch "(?i)\bunhealthy\b")
+    $validityPass =
+      ($localPosition -match "(?m)^\s*z_valid:\s*True\s*$") -and
+      ($localPosition -match "(?m)^\s*v_z_valid:\s*True\s*$") -and
+      ($localPosition -match "(?m)^\s*v_xy_valid:\s*True\s*$")
+
+    $velTestRatio = Get-Px4NumericField $estimator "vel_test_ratio"
+    $localZ = Get-Px4NumericField $localPosition "z"
+    $localVz = Get-Px4NumericField $localPosition "vz"
+    $truthZ = Get-Px4NumericField $groundTruth "z"
+    $truthVz = Get-Px4NumericField $groundTruth "vz"
+    $gyroDt = Get-Px4NumericField $sensor "gyro_integral_dt"
+    $accelDt = Get-Px4NumericField $sensor "accelerometer_integral_dt"
+    $zReset = Get-Px4NumericField $localPosition "z_reset_counter"
+    $vzReset = Get-Px4NumericField $localPosition "vz_reset_counter"
+
+    $innovationPass = ($null -ne $velTestRatio) -and ($velTestRatio -le 1.0)
+    $velocityPass =
+      ($null -ne $localVz) -and ($null -ne $truthVz) -and
+      ([Math]::Abs($localVz) -le $GroundGateMaxVzMps) -and
+      ([Math]::Abs($localVz - $truthVz) -le $GroundGateMaxVzMps)
+    $heightPass =
+      ($null -ne $localZ) -and ($null -ne $truthZ) -and
+      ([Math]::Abs($localZ - $truthZ) -le 0.30)
+    $imuCadencePass =
+      ($null -ne $gyroDt) -and ($null -ne $accelDt) -and
+      ($gyroDt -ge 2000) -and ($gyroDt -le 20000) -and
+      ($accelDt -ge 2000) -and ($accelDt -le 20000)
+    $resetStable =
+      ($null -ne $zReset) -and ($null -ne $vzReset) -and
+      (($null -eq $previousZReset) -or (($zReset -eq $previousZReset) -and ($vzReset -eq $previousVzReset)))
+
+    $probePass =
+      $commanderPass -and (-not $commanderFailed) -and $ekfPass -and
+      $validityPass -and $innovationPass -and $velocityPass -and
+      $heightPass -and $imuCadencePass -and $resetStable
+
+    $resultLine = "attempt=$attempt pass=$probePass commander=$commanderPass ekf=$ekfPass validity=$validityPass vel_ratio=$velTestRatio local_z=$localZ truth_z=$truthZ local_vz=$localVz truth_vz=$truthVz gyro_dt_us=$gyroDt accel_dt_us=$accelDt z_reset=$zReset vz_reset=$vzReset reset_stable=$resetStable"
+    Write-Step "ground convergence probe: $resultLine"
+    Add-Content -LiteralPath $gateLog -Value "RESULT $resultLine" -Encoding UTF8
+
+    if ($probePass) { $consecutive++ } else { $consecutive = 0 }
+    $previousZReset = $zReset
+    $previousVzReset = $vzReset
+
+    if ($consecutive -ge $GroundGateRequiredConsecutive) {
+      Write-Step "ok: PX4 ground convergence gate passed ($consecutive consecutive probes)"
+      return $true
+    }
+    if ($attempt -lt $GroundGateMaxAttempts) {
+      Start-Sleep -Seconds $GroundGateIntervalSec
+    }
+  }
+
+  Write-Step "failed: PX4 ground convergence gate"
+  return $false
 }
 
 function Get-WslPath {
@@ -309,9 +498,11 @@ function Update-StatusFromArtifacts {
   $takeoffLogPath = Join-Path $script:RunDir "takeoff_offboard.log"
   $telemetryLogPath = Join-Path $script:RunDir "telemetry.log"
 
-  $px4Log = if (Test-Path $px4LogPath) { Get-Content -Raw -Encoding UTF8 $px4LogPath } else { "" }
-  $takeoffLog = if (Test-Path $takeoffLogPath) { Get-Content -Raw -Encoding UTF8 $takeoffLogPath } else { "" }
-  $telemetryLog = if (Test-Path $telemetryLogPath) { Get-Content -Raw -Encoding UTF8 $telemetryLogPath } else { "" }
+  # Windows PowerShell 5.1 returns $null for an existing zero-byte file with
+  # Get-Content -Raw. Normalize every log to a string before regex matching.
+  $px4Log = if (Test-Path $px4LogPath) { [string](Get-Content -Raw -Encoding UTF8 $px4LogPath) } else { "" }
+  $takeoffLog = if (Test-Path $takeoffLogPath) { [string](Get-Content -Raw -Encoding UTF8 $takeoffLogPath) } else { "" }
+  $telemetryLog = if (Test-Path $telemetryLogPath) { [string](Get-Content -Raw -Encoding UTF8 $telemetryLogPath) } else { "" }
 
   $script:Status.PX4Connected = $script:Status.PX4Connected -or ($px4Log -match "Simulator connected")
   $script:Status.PX4Ready = $script:Status.PX4Ready -or ($px4Log -match "Ready for takeoff")
@@ -356,6 +547,7 @@ function Write-Summary {
     "- Vehicle: $Vehicle",
     "- Project: $Project",
     "- Graphics: $GraphicsRhi ${WindowWidth}x${WindowHeight} NoSound=$NoSound",
+    "- MaxFps: $MaxFps",
     "- Alt/Hold/Climb/Descend: $Alt / $Hold / $Climb / $Descend",
     "- HeadwindTest: $HeadwindTest",
     "- HeadwindDistance/Move: $HeadwindDistance / $Move",
@@ -364,6 +556,7 @@ function Write-Summary {
     "- VerticalParams ZP/ZVelP/ZVelI/ZVelD/Hover: $MpcZP / $MpcZVelPAcc / $MpcZVelIAcc / $MpcZVelDAcc / $MpcThrHover",
     "- EKF2_ABL_LIM: $Ekf2AblLim",
     "- EstimatorSettleSec: $EstimatorSettleSec",
+    "- GroundGate: $GroundGateRequiredConsecutive consecutive / $GroundGateMaxAttempts attempts; interval ${GroundGateIntervalSec}s; max abs Vz $GroundGateMaxVzMps m/s",
     "- TelemetryDurationSec: $TelemetryDurationSec",
     "- ShowWindArrows: $ShowWindArrows",
     "- WindUI: $WindUI",
@@ -386,7 +579,8 @@ function Write-Summary {
     "- telemetry.log",
     "- takeoff_offboard.log",
     "- Unreal-latest.log",
-    "- hil_debug.csv"
+    "- hil_debug.csv",
+    "- ground_convergence_gate.log"
   )
   Set-Content -Path $summaryPath -Value ($lines -join "`r`n") -Encoding UTF8
   Write-Step "summary written: $summaryPath"
@@ -418,15 +612,26 @@ function Write-Summary {
 }
 
 function Start-Validation {
+  if ($GroundGateRequiredConsecutive -gt $GroundGateMaxAttempts) {
+    throw "GroundGateRequiredConsecutive cannot exceed GroundGateMaxAttempts"
+  }
   Require-File $UnrealEditor "UnrealEditor"
   Require-File $Project "UE project"
+  if (-not $SkipTelemetryListener -or -not $SkipFlight) {
+    $script:PythonExe = Resolve-PythonExecutable $PythonExe
+    Write-Step "Windows Python: $script:PythonExe"
+  }
+  if (-not $SkipTelemetryListener) {
+    Require-File (Join-Path $script:SourceDir "listen_telem_long.py") "UE telemetry listener"
+  }
 
   if ($DryRun) {
     Write-Step "dry run only"
     Write-Step "repo root: $script:RepoRoot"
     Write-Step "run dir: $script:RunDir"
-    Write-Step "UE: $UnrealEditor"
-    Write-Step "project: $Project"
+  Write-Step "UE: $UnrealEditor"
+  Write-Step "project: $Project"
+  Write-Step "runtime graphics: $GraphicsRhi ${WindowWidth}x${WindowHeight}; MaxFps=$MaxFps; NoSound=$NoSound"
   Write-Step "map: $Map"
   Write-Step "vehicle: $Vehicle"
   Write-Step "WSL launch: $WslLaunchScript"
@@ -436,6 +641,7 @@ function Start-Validation {
   Write-Step "UE telemetry target: ${TelemetryHost}:${TelemetryPort}; listener skipped=$SkipTelemetryListener"
   Write-Step "flight pattern: $FlightPattern circle=$CircleRadius m x $CircleLaps lap(s) / ${CircleDuration}s"
   Write-Step "vertical params: Z_P=$MpcZP Z_VEL_PI_D=$MpcZVelPAcc/$MpcZVelIAcc/$MpcZVelDAcc THR_HOVER=$MpcThrHover ABL_LIM=$Ekf2AblLim settle=${EstimatorSettleSec}s"
+  Write-Step "ground convergence gate: $GroundGateRequiredConsecutive consecutive / $GroundGateMaxAttempts attempts, interval=${GroundGateIntervalSec}s, max_abs_vz=$GroundGateMaxVzMps m/s"
     return
   }
 
@@ -449,9 +655,12 @@ function Start-Validation {
   Remove-Item -LiteralPath "C:\tmp\hil_debug.csv" -Force -ErrorAction SilentlyContinue
 
   Write-Step "starting UE game mode"
-  $ueArgs = @($Project, $Map, "-game", "-windowed", "-ResX=$WindowWidth", "-ResY=$WindowHeight", "-$GraphicsRhi", "-DarkGround", "-log")
+  $ueArgs = @($Project, $Map, "-game", "-windowed", "-windowtitle=`"$WindowTitle`"", "-ResX=$WindowWidth", "-ResY=$WindowHeight", "-$GraphicsRhi", "-DarkGround", "-log")
   if ($NoSound) {
     $ueArgs += "-nosound"
+  }
+  if ($MaxFps -gt 0) {
+    $ueArgs += "-ExecCmds=`"t.MaxFPS $MaxFps`""
   }
   if ($ShowWindArrows) {
     $ueArgs += "-ShowWindArrows"
@@ -514,11 +723,20 @@ function Start-Validation {
     }
     (Invoke-WslText "test -f /tmp/px4_sitl_1.log && grep -q 'Ready for takeoff' /tmp/px4_sitl_1.log && echo OK || true") -match "OK"
   }
-  if (-not $script:Status.PX4Ready) { throw "PX4 did not become ready for takeoff" }
+  if (-not $script:Status.PX4Ready) {
+    Collect-Px4ReadinessDiagnostics
+    throw "PX4 did not become ready for takeoff"
+  }
 
   if ($EstimatorSettleSec -gt 0) {
     Write-Step "waiting ${EstimatorSettleSec}s for ground-state estimator convergence"
     Start-Sleep -Seconds $EstimatorSettleSec
+  }
+
+  $script:Status.GroundConvergencePassed = Test-Px4GroundConvergence
+  if (-not $script:Status.GroundConvergencePassed) {
+    Collect-Px4ReadinessDiagnostics
+    throw "PX4 ground-state estimator did not remain converged"
   }
 
   if (-not $SkipTelemetryListener) {
@@ -592,28 +810,34 @@ try {
 }
 finally {
   if (-not $DryRun) {
-    Copy-WslArtifacts
-    Copy-UELog
-    Write-Summary
-    if (-not $KeepRunning) {
-      if ($script:TelemetryProc -and -not $script:TelemetryProc.HasExited) {
-        Stop-Process -Id $script:TelemetryProc.Id -Force -ErrorAction SilentlyContinue
-      }
-      Stop-WslSim
-      if ($script:UEProc -and -not $script:UEProc.HasExited) {
-        Write-Step "stopping UnrealEditor pid $($script:UEProc.Id)"
-        Stop-Process -Id $script:UEProc.Id -Force -ErrorAction SilentlyContinue
-      }
+    try {
+      Copy-WslArtifacts
+      Copy-UELog
+      Write-Summary
     }
-    else {
-      Write-Step "KeepRunning set; UE/PX4 were left running"
+    finally {
+      # Cleanup must still run when artifact collection or summary generation
+      # fails; only terminate processes created by this validation session.
+      if (-not $KeepRunning) {
+        if ($script:TelemetryProc -and -not $script:TelemetryProc.HasExited) {
+          Stop-Process -Id $script:TelemetryProc.Id -Force -ErrorAction SilentlyContinue
+        }
+        Stop-WslSim
+        if ($script:UEProc -and -not $script:UEProc.HasExited) {
+          Write-Step "stopping UnrealEditor pid $($script:UEProc.Id)"
+          Stop-Process -Id $script:UEProc.Id -Force -ErrorAction SilentlyContinue
+        }
+      }
+      else {
+        Write-Step "KeepRunning set; UE/PX4 were left running"
+      }
     }
   }
 }
 
 if (-not $DryRun -and -not $SkipFlight) {
   Update-StatusFromArtifacts
-  $required = @("UEStarted", "UEPortListening", "PX4Started", "PX4Connected", "PX4Ready", "FlightScriptRan", "Armed", "Offboard", "TakeoffDetected", "Disarmed", "TelemetryPass")
+  $required = @("UEStarted", "UEPortListening", "PX4Started", "PX4Connected", "PX4Ready", "GroundConvergencePassed", "FlightScriptRan", "Armed", "Offboard", "TakeoffDetected", "Disarmed", "TelemetryPass")
   $failed = @($required | Where-Object { -not $script:Status[$_] })
   if ($script:Status.Failsafe) { $failed += "NoFailsafe" }
   $flightResultPath = Join-Path $script:RunDir "flight_analysis.json"

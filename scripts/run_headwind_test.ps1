@@ -23,6 +23,14 @@ param(
   [double]$Ekf2AblLim = 5.0,
   [ValidateRange(0, 120)]
   [int]$EstimatorSettleSec = 35,
+  [string]$PythonExe = "python",
+  [ValidateSet("dx11", "dx12")]
+  [string]$GraphicsRhi = "dx12",
+  [int]$WindowWidth = 1280,
+  [int]$WindowHeight = 720,
+  [ValidateRange(0, 1000)]
+  [int]$MaxFps = 0,
+  [switch]$NoSound,
   [int]$TcpTimeoutSec = 90,
   [int]$Px4TimeoutSec = 120,
   [int]$FlightTimeoutSec = 120,
@@ -74,6 +82,12 @@ $verifyParams = @{
   MpcThrHover = $MpcThrHover
   Ekf2AblLim = $Ekf2AblLim
   EstimatorSettleSec = $EstimatorSettleSec
+  PythonExe = $PythonExe
+  GraphicsRhi = $GraphicsRhi
+  WindowWidth = $WindowWidth
+  WindowHeight = $WindowHeight
+  MaxFps = $MaxFps
+  NoSound = $NoSound
   TcpTimeoutSec = $TcpTimeoutSec
   Px4TimeoutSec = $Px4TimeoutSec
   FlightTimeoutSec = $FlightTimeoutSec

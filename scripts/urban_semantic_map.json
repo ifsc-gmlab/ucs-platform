@@ -1,5 +1,7 @@
 {
   "map_id": "sztu_urban_semantic_v1",
+  "brand": "IFSC",
+  "display_name": "IFSC 城市语义巡检",
   "ue_map": "/Game/Maps/SZTUUrbanSemanticScene",
   "frame": "PX4_LOCAL_NED",
   "origin_world_m": [2.5, 0.0, 0.0],
